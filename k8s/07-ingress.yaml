@@ -1,0 +1,59 @@
+# Ingress — HTTP/HTTPS routing ke service
+#
+# Deploy production: ict.uinsgd.ac.id/siaptes/api — SAMA host dengan
+# frontend-ict ("/"), backend-ict ("/api"), dan frontend-siaptes ("/siaptes").
+#
+# PENTING — rewrite-target WAJIB ada: src/app.js memasang semua route di ROOT
+# ("app.use('/', maintenanceGate, routes)"), bukan di bawah prefix apa pun —
+# ini sengaja (lihat komentar di app.js) supaya endpoint lama yang sudah
+# dipanggil BE ICT (mis. /tes-grup/histori) tidak berubah kontrak. Karena itu,
+# ingress HARUS strip "/siaptes/api" sebelum request sampai ke pod, kalau
+# tidak semua route bakal 404 (Express tidak tahu apa-apa soal prefix itu).
+#
+# Prasyarat — Ingress Controller nginx harus terinstall (lihat backend-ict/k8s
+# untuk link instalasi kalau belum ada).
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-siaptes-ingress
+  namespace: backend-siaptes
+  labels:
+    app.kubernetes.io/name: backend-siaptes
+  annotations:
+    # ── Body & Timeout ──────────────────────────────────────────────────────
+    nginx.ingress.kubernetes.io/proxy-body-size: '50m'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '60'
+    nginx.ingress.kubernetes.io/proxy-send-timeout: '60'
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: '10'
+
+    # ── Rate Limiting (lapisan ingress) ─────────────────────────────────────
+    nginx.ingress.kubernetes.io/limit-rps: '50'
+    nginx.ingress.kubernetes.io/limit-connections: '20'
+
+    # Strip "/siaptes/api" sebelum diteruskan ke pod — lihat catatan PENTING di atas.
+    # Regex capture group $2 = sisa path setelah "/siaptes/api" (mis. "/siaptes/api/soal" → "/soal").
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: 'true'
+
+    # ── TLS via cert-manager (Let's Encrypt) ────────────────────────────────
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ict.uinsgd.ac.id
+      http:
+        paths:
+          - path: /siaptes/api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: backend-siaptes
+                port:
+                  number: 3100
+
+  # tls:
+  #   - hosts:
+  #       - ict.uinsgd.ac.id
+  #     secretName: backend-siaptes-tls

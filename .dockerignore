@@ -1,0 +1,36 @@
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Environment (jangan copy ke image) ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Git ──────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ─── Logs & Runtime data ──────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Cache ────────────────────────────────────────────────────────────────────
+.cache/
+.eslintcache
+.npm/
+
+# ─── OS & Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── Docs & SQL dump root (lihat .gitignore) ──────────────────────────────────
+*.md
+*.sql
+
+# ─── K8s (tidak perlu ikut ke dalam image) ────────────────────────────────────
+k8s/
+.circleci/

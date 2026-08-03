@@ -1,0 +1,24 @@
+# ConfigMap — variabel non-sensitif, aman untuk di-commit.
+# Variabel sensitif (password, secret key) ada di secret.yaml (lihat 02-secret.yaml.example)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-siaptes-config
+  namespace: backend-siaptes
+  labels:
+    app.kubernetes.io/name: backend-siaptes
+data:
+  NODE_ENV: 'production'
+  PORT: '3100'
+
+  # JWT — durasi token, bukan secret
+  JWT_EXPIRES_IN: '8h'
+
+  # CORS — boleh comma-separated (lihat src/app.js). Satu origin ini sudah
+  # cukup buat 2 pemanggil: FE ICT admin (root "/") dan FE Siaptes peserta
+  # (subpath "/siaptes") — keduanya di-host di domain yang sama, jadi Origin
+  # header browser-nya identik terlepas dari path.
+  CORS_ORIGIN: 'https://ict.uinsgd.ac.id'
+
+  # External API — URL host (non-sensitif, key ada di Secret)
+  SALAM_API_URL: 'https://api.uinsgd.ac.id/salam/v2/'

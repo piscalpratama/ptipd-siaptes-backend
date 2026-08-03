@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-siaptes
+  namespace: backend-siaptes
+  labels:
+    app: backend-siaptes
+    app.kubernetes.io/name: backend-siaptes
+    app.kubernetes.io/version: '1.0.0'
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-siaptes
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0 # zero-downtime: pod baru harus Running sebelum pod lama dihapus
+
+  template:
+    metadata:
+      labels:
+        app: backend-siaptes
+      annotations:
+        # Update value ini (misal tanggal) untuk trigger redeploy manual
+        kubectl.kubernetes.io/restartedAt: '2026-08-04T00:00:00Z'
+
+    spec:
+      # ── Image Pull Secret (Docker Hub) ──────────────────────────────────────
+      # Secret harus dibuat terlebih dahulu:
+      #   kubectl create secret docker-registry dockerhub-pull-secret \
+      #     --namespace backend-siaptes \
+      #     --docker-server=https://index.docker.io/v1/ \
+      #     --docker-username=<DOCKERHUB_USERNAME> \
+      #     --docker-password=<DOCKERHUB_TOKEN>
+      imagePullSecrets:
+        - name: dockerhub-pull-secret
+
+      # ── Spread replica ke node berbeda (High Availability) ─────────────────
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: backend-siaptes
+
+      containers:
+        - name: app
+          # Image dari Docker Hub org uinsgd — format: <org>/<repo>:<tag>
+          # CI/CD (CircleCI) akan update nilai ini otomatis saat deploy
+          image: uinsgd/backend-siaptes:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 3100
+              protocol: TCP
+
+          # ── Environment Variables ──────────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: backend-siaptes-config
+            - secretRef:
+                name: backend-siaptes-secret
+
+          # ── Resource Limits ───────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: '250m'
+              memory: '256Mi'
+            limits:
+              cpu: '1000m'
+              memory: '512Mi'
+
+          # ── Liveness Probe ────────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3100
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          # ── Readiness Probe ───────────────────────────────────────────────
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3100
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ── Startup Probe ─────────────────────────────────────────────────
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3100
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12 # toleransi hingga 10+12×5 = 70 detik startup
+
+          # ── Security Context (Container) ──────────────────────────────────
+          # App ini stateless (tidak ada file lokal atau log-to-disk) — root
+          # filesystem bisa read-only.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1001
+            capabilities:
+              drop:
+                - ALL
+
+          # ── Volume Mounts ─────────────────────────────────────────────────
+          # /tmp emptyDir — jaring pengaman untuk readOnlyRootFilesystem.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # ── Pod Security Context ─────────────────────────────────────────────
+      securityContext:
+        fsGroup: 1001
+
+      # ── Graceful Shutdown ─────────────────────────────────────────────────
+      terminationGracePeriodSeconds: 30
+
+      restartPolicy: Always

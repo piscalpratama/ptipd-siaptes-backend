@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend-siaptes
+  labels:
+    app.kubernetes.io/name: backend-siaptes
+    app.kubernetes.io/managed-by: kubectl

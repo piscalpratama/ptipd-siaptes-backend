@@ -1,0 +1,303 @@
+# =============================================================================
+# .circleci/config.yml — CI/CD: Build, Push Docker Hub → Deploy ke Kubernetes
+# =============================================================================
+#
+# Alur kerja:
+#   1. Push ke branch `production` → build & push image, lalu auto-deploy ke K8s
+#   2. Push tag `v*.*.*`           → build & push image dengan semver tag (tanpa deploy otomatis)
+#   3. Manual trigger              → via CircleCI dashboard (Trigger Pipeline)
+#
+# Alur branch yang direkomendasikan:
+#   feature/xxx → master → (Pull Request) → production → CI/CD build & deploy
+#
+# Setup wajib (CircleCI → Project Settings → Environment Variables):
+#   DOCKERHUB_USERNAME   → username personal Docker Hub — dipakai untuk `docker login`
+#   DOCKERHUB_TOKEN      → Access Token Docker Hub personal (bukan password!)
+#                          Buat di: https://hub.docker.com/settings/security
+#                          Pastikan akun punya akses write ke org uinsgd
+#   DOCKERHUB_ORG        → namespace organisasi Docker Hub (isi: uinsgd) — prefix nama image
+#   KUBECONFIG_BASE64    → isi dengan output perintah berikut di k8s-master:
+#                          cat ~/.kube/config | base64 -w 0
+#   BASTION_SSH_KEY      → private key SSH bastion (base64) — tunnel ke API K8s privat
+#   BASTION_USER         → user SSH bastion
+#   BASTION_HOST         → host/IP bastion
+#
+# Nama image: <DOCKERHUB_ORG>/backend-siaptes  (mis. uinsgd/backend-siaptes)
+# =============================================================================
+
+version: 2.1
+
+# ── Orbs ──────────────────────────────────────────────────────────────────────
+orbs:
+  docker: circleci/docker@2.6.0
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1: Build & Push ke Docker Hub
+  # ════════════════════════════════════════════════════════════════════════════
+  build-and-push:
+    machine:
+      image: ubuntu-2204:current # machine executor agar support Docker Buildx & QEMU
+    resource_class: medium
+
+    environment:
+      IMAGE_NAME: backend-siaptes
+
+    steps:
+      # ── 1. Checkout kode ───────────────────────────────────────────────────
+      - checkout
+
+      # ── 2. Setup QEMU (multi-platform: amd64 + arm64) ─────────────────────
+      - run:
+          name: Set up QEMU
+          command: |
+            docker run --privileged --rm tonistiigi/binfmt --install all
+
+      # ── 3. Setup Docker Buildx ─────────────────────────────────────────────
+      - run:
+          name: Set up Docker Buildx
+          command: |
+            docker buildx create --name multiarch --driver docker-container --use
+            docker buildx inspect --bootstrap
+
+      # ── 4. Login ke Docker Hub ─────────────────────────────────────────────
+      - run:
+          name: Login to Docker Hub
+          command: |
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+      # ── 5. Generate image tags ─────────────────────────────────────────────
+      # Push tag v1.2.3    → image tag: :v1.2.3 + :1.2 + :latest + :sha-<7char>
+      # Push ke production → image tag: :latest + :sha-<7char>
+      # Tag SHA digunakan oleh job deploy agar K8s bisa rollback per commit
+      - run:
+          name: Generate Docker tags
+          command: |
+            FULL_IMAGE="${DOCKERHUB_ORG:-uinsgd}/$IMAGE_NAME"
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
+
+            if [[ "$CIRCLE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              VERSION="${BASH_REMATCH[1]}"
+              MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
+              TAGS="$FULL_IMAGE:$CIRCLE_TAG,$FULL_IMAGE:$MAJOR_MINOR,$FULL_IMAGE:latest,$FULL_IMAGE:sha-$SHORT_SHA"
+              echo "Mode: Tag release ($CIRCLE_TAG)"
+            elif [[ "$CIRCLE_BRANCH" == "production" ]]; then
+              TAGS="$FULL_IMAGE:latest,$FULL_IMAGE:sha-$SHORT_SHA"
+              echo "Mode: Branch production"
+            elif [[ "$CIRCLE_BRANCH" == "master" ]]; then
+              TAGS="$FULL_IMAGE:dev,$FULL_IMAGE:sha-$SHORT_SHA"
+              echo "Mode: Branch master (server development)"
+            else
+              echo "Branch/tag tidak dikenali, skip."
+              exit 1
+            fi
+
+            echo "Tags yang akan di-push: $TAGS"
+            echo "export DOCKER_TAGS=\"$TAGS\""           >> "$BASH_ENV"
+            echo "export FULL_IMAGE=\"$FULL_IMAGE\""      >> "$BASH_ENV"
+            echo "export SHORT_SHA=\"$SHORT_SHA\""        >> "$BASH_ENV"
+
+      # ── 6. Build & Push image (multi-platform) ─────────────────────────────
+      - run:
+          name: Build and push Docker image
+          command: |
+            source "$BASH_ENV"
+
+            TAG_ARGS=""
+            for tag in $(echo "$DOCKER_TAGS" | tr ',' ' '); do
+              TAG_ARGS="$TAG_ARGS --tag $tag"
+            done
+
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --file ./Dockerfile \
+              --target production \
+              --build-arg GIT_COMMIT="$SHORT_SHA" \
+              $TAG_ARGS \
+              --cache-from type=registry,ref=$FULL_IMAGE:buildcache \
+              --cache-to type=registry,ref=$FULL_IMAGE:buildcache,mode=max \
+              --push \
+              .
+
+      # ── 7. Simpan SHA ke workspace untuk job deploy ────────────────────────
+      - run:
+          name: Save build info to workspace
+          command: |
+            source "$BASH_ENV"
+            mkdir -p /tmp/workspace
+            echo "$SHORT_SHA"   > /tmp/workspace/short_sha
+            echo "$FULL_IMAGE"  > /tmp/workspace/full_image
+
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths:
+            - short_sha
+            - full_image
+
+      # ── 8. Summary ─────────────────────────────────────────────────────────
+      - run:
+          name: Print image tags
+          command: |
+            source "$BASH_ENV"
+            echo "Image berhasil di-push:"
+            echo "$DOCKER_TAGS" | tr ',' '\n'
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2: Deploy ke Kubernetes
+  # Hanya berjalan saat push ke branch production (TIDAK saat push tag semver)
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy-to-k8s:
+    docker:
+      - image: alpine/k8s:1.30.4
+    resource_class: small
+
+    environment:
+      K8S_NAMESPACE: backend-siaptes
+      K8S_DEPLOYMENT: backend-siaptes
+      K8S_CONTAINER: app
+
+    steps:
+      # ── 1. Ambil SHA dari job build ────────────────────────────────────────
+      - attach_workspace:
+          at: /tmp/workspace
+
+      - run:
+          name: Load build info
+          command: |
+            SHORT_SHA=$(cat /tmp/workspace/short_sha)
+            FULL_IMAGE=$(cat /tmp/workspace/full_image)
+            echo "export SHORT_SHA=\"$SHORT_SHA\""   >> "$BASH_ENV"
+            echo "export FULL_IMAGE=\"$FULL_IMAGE\"" >> "$BASH_ENV"
+            echo "Deploy image: $FULL_IMAGE:sha-$SHORT_SHA"
+
+      # ── 2. Setup kubeconfig ────────────────────────────────────────────────
+      - run:
+          name: Setup kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            echo "$KUBECONFIG_BASE64" | base64 -d > ~/.kube/config
+            chmod 600 ~/.kube/config
+
+      # ── 3. SSH tunnel ke K8s API (cluster di jaringan privat) ─────────────
+      - run:
+          name: Install SSH dan netcat
+          command: |
+            apk add --no-cache openssh-client netcat-openbsd
+
+      - run:
+          name: Setup SSH tunnel ke K8s API
+          background: true
+          command: |
+            mkdir -p ~/.ssh
+            echo "$BASTION_SSH_KEY" | base64 -d > ~/.ssh/bastion_key
+            chmod 600 ~/.ssh/bastion_key
+            # -4 + bind eksplisit 127.0.0.1: runner CircleCI tanpa IPv6 → tanpa ini ssh
+            # mencoba bind [::1]:6443 dan gagal ("Address not available").
+            ssh -i ~/.ssh/bastion_key \
+              -4 \
+              -L 127.0.0.1:6443:192.168.18.90:6443 \
+              -N \
+              -o StrictHostKeyChecking=no \
+              -o ServerAliveInterval=30 \
+              "$BASTION_USER@$BASTION_HOST"
+
+      - run:
+          name: Tunggu tunnel siap
+          command: |
+            for i in $(seq 1 10); do
+              if nc -z 127.0.0.1 6443 2>/dev/null; then
+                echo "Tunnel siap."
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Tunnel gagal terbuka."
+            exit 1
+
+      - run:
+          name: Arahkan kubeconfig ke tunnel lokal
+          command: |
+            sed -i -E 's#https://192\.168\.18\.(145|90):6443#https://127.0.0.1:6443#g' ~/.kube/config
+            CLUSTER_NAME=$(kubectl config view -o jsonpath='{.clusters[0].name}')
+            if [ -z "$CLUSTER_NAME" ]; then
+              echo "ERROR: Cluster name kosong. Pastikan KUBECONFIG_BASE64 sudah benar."
+              kubectl config view
+              exit 1
+            fi
+            kubectl config set-cluster "$CLUSTER_NAME" --tls-server-name=k8s-vip
+
+      # ── 4. Verifikasi koneksi cluster ──────────────────────────────────────
+      - run:
+          name: Verifikasi koneksi cluster
+          command: |
+            kubectl cluster-info
+            kubectl get nodes
+
+      # ── 5. Update image ke tag SHA ─────────────────────────────────────────
+      # Pakai tag SHA (bukan :latest) agar:
+      # - Kubernetes pasti pull image baru, bukan dari cache node
+      # - Bisa rollback ke commit tertentu: kubectl rollout undo deployment/backend-siaptes -n backend-siaptes
+      # - Audit trail: kubectl rollout history deployment/backend-siaptes -n backend-siaptes
+      - run:
+          name: Update image deployment
+          command: |
+            source "$BASH_ENV"
+            kubectl set image deployment/$K8S_DEPLOYMENT \
+              $K8S_CONTAINER="$FULL_IMAGE:sha-$SHORT_SHA" \
+              -n $K8S_NAMESPACE
+
+      # ── 6. Tunggu rollout selesai ──────────────────────────────────────────
+      - run:
+          name: Tunggu rollout selesai
+          command: |
+            kubectl rollout status deployment/$K8S_DEPLOYMENT \
+              -n $K8S_NAMESPACE \
+              --timeout=180s
+
+      # ── 7. Verifikasi hasil deploy ─────────────────────────────────────────
+      - run:
+          name: Verifikasi pod dan HPA
+          command: |
+            echo "──── Pods ────"
+            kubectl get pods -n $K8S_NAMESPACE -o wide
+            echo ""
+            echo "──── HPA ────"
+            kubectl get hpa -n $K8S_NAMESPACE
+            echo ""
+            echo "──── Image aktif ────"
+            kubectl get deployment $K8S_DEPLOYMENT -n $K8S_NAMESPACE \
+              -o jsonpath='{.spec.template.spec.containers[0].image}'
+            echo ""
+
+      # ── 8. Rollback otomatis jika deploy gagal ─────────────────────────────
+      - run:
+          name: Rollback jika gagal
+          command: |
+            echo "Deploy gagal! Rollback ke versi sebelumnya..."
+            kubectl rollout undo deployment/$K8S_DEPLOYMENT -n $K8S_NAMESPACE
+            echo "Rollback selesai. Status pod:"
+            kubectl get pods -n $K8S_NAMESPACE
+          when: on_fail
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+workflows:
+  build-and-push-workflow:
+    jobs:
+      # Build & Push: jalankan saat push ke production ATAU push tag semver
+      - build-and-push:
+          filters:
+            branches:
+              only: [production, master]
+            tags:
+              only: /^v\d+\.\d+\.\d+$/ # contoh: v1.2.0, v1.2.1
+
+      # Deploy ke K8s: HANYA saat push ke branch production, abaikan tag semver
+      - deploy-to-k8s:
+          requires:
+            - build-and-push
+          filters:
+            branches:
+              only: production
+            tags:
+              ignore: /.*/

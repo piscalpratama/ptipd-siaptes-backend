@@ -4,3 +4,6 @@ node_modules/
 
 # Dump/skema SQL di root — bukan migration terstruktur, jangan di-commit
 /*.sql
+
+# k8s secret asli — jangan pernah commit, cuma .example yang di-commit
+k8s/02-secret.yaml

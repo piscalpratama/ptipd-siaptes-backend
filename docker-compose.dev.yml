@@ -1,0 +1,45 @@
+# Development — hot-reload via nodemon
+# MySQL SEMUA eksternal (konfigurasi di .env)
+#
+# Cara pakai:
+#   docker compose -f docker-compose.dev.yml up -d
+#   docker compose -f docker-compose.dev.yml logs -f app
+#
+# MySQL eksternal: DB_HOST=192.168.18.181
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder      # stage dengan devDependencies (nodemon tersedia)
+    image: backend-siaptes:dev
+    container_name: backend-siaptes-dev
+    restart: unless-stopped
+
+    ports:
+      - "0.0.0.0:${PORT:-3100}:${PORT:-3100}"
+
+    env_file:
+      - .env
+
+    environment:
+      - NODE_ENV=development
+
+    # extra_hosts: akses ke host machine kalau MySQL di host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - .:/app                 # bind-mount source → perubahan kode langsung tercermin
+      - /app/node_modules      # preserve node_modules dari image, jangan di-override volume
+
+    command: npm run dev
+
+    networks:
+      - backend-net-dev
+
+networks:
+  backend-net-dev:
+    driver: bridge
+    attachable: true

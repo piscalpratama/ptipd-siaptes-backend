@@ -1,0 +1,49 @@
+# Production — standalone single node
+# MySQL SEMUA eksternal (konfigurasi di .env)
+#
+# Cara pakai di VPS:
+#   1. Pastikan file .env sudah ada di folder yang sama
+#   2. docker compose pull          ← ambil image terbaru dari Docker Hub
+#   3. docker compose up -d         ← jalankan container
+#   4. docker compose logs -f app   ← pantau log
+#
+# Update image setelah CI/CD push:
+#   docker compose pull && docker compose up -d
+#
+# MySQL eksternal: set DB_HOST dan DB_PORT di .env
+
+services:
+  app:
+    # Pull image dari Docker Hub (hasil CI/CD CircleCI)
+    # Tidak perlu build manual di VPS
+    image: ${DOCKERHUB_ORG:-uinsgd}/backend-siaptes:latest
+    container_name: backend-siaptes
+    restart: unless-stopped
+
+    # Bind ke semua interface → dapat diakses dari VM lain, bukan hanya localhost
+    ports:
+      - "0.0.0.0:${PORT:-3100}:${PORT:-3100}"
+
+    env_file:
+      - .env
+
+    # extra_hosts: akses ke host machine dari dalam container
+    # Berguna kalau MySQL berjalan di host (bukan VM terpisah)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    networks:
+      - backend-net
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:${PORT:-3100}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+networks:
+  backend-net:
+    driver: bridge
+    # attachable: true → container lain (di luar compose ini) bisa join network
+    attachable: true
