@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+
+# Dump/skema SQL di root — bukan migration terstruktur, jangan di-commit
+/*.sql
