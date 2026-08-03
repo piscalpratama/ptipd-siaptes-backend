@@ -1,0 +1,323 @@
+const db = require('../config/db');
+const { createError } = require('../middleware/errorHandler');
+const { parseGrupIds } = require('../utils/grupUtil');
+
+const shuffle = (arr) => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
+// ─── Daftar ujian yang tersedia buat peserta ─────────────────────────────────
+
+const getSaya = async (pesertaId) => {
+  const [[user]] = await db.execute(`SELECT idm_grup FROM tbs_user WHERE ids_user = ? LIMIT 1`, [pesertaId]);
+  const grupIds = parseGrupIds(user?.idm_grup);
+  if (!grupIds.length) return [];
+
+  const placeholders = grupIds.map(() => '?').join(',');
+  const [tesList] = await db.query(
+    `SELECT DISTINCT t.idm_tes, t.nama_tes, t.keterangan, t.tgl_mulai, t.tgl_akhir,
+            t.durasi, t.skor_maksimal, t.status_hasil, t.status_token
+     FROM tbr_tes_grup rg
+     JOIN tbm_tes t ON rg.idm_tes = t.idm_tes
+     WHERE rg.idm_grup IN (${placeholders}) AND t.is_deleted = 0
+     ORDER BY t.tgl_mulai DESC`,
+    grupIds,
+  );
+
+  for (const tes of tesList) {
+    const [attempts] = await db.execute(
+      `SELECT idh_tes, percobaan, nilai, waktu_mulai, waktu_akhir, status
+       FROM tbh_tes WHERE idm_tes = ? AND created_by = ? ORDER BY idh_tes DESC LIMIT 1`,
+      [tes.idm_tes, pesertaId],
+    );
+    tes.attempt = attempts[0] || null;
+  }
+
+  return tesList;
+};
+
+// ─── Cari idr_tes_grup peserta buat 1 tes tertentu (buat validasi token) ─────
+
+const findTesGrupForPeserta = async (idmTes, pesertaId) => {
+  const [[user]] = await db.execute(`SELECT idm_grup FROM tbs_user WHERE ids_user = ? LIMIT 1`, [pesertaId]);
+  const grupIds = parseGrupIds(user?.idm_grup);
+  if (!grupIds.length) return null;
+
+  const placeholders = grupIds.map(() => '?').join(',');
+  const [rows] = await db.query(
+    `SELECT idr_tes_grup, idm_grup FROM tbr_tes_grup WHERE idm_tes = ? AND idm_grup IN (${placeholders}) LIMIT 1`,
+    [idmTes, ...grupIds],
+  );
+  return rows[0] || null;
+};
+
+// ─── Generate soal sesuai aturan tbr_tes_topik ───────────────────────────────
+
+const generateDataSoal = async (idmTes) => {
+  const [rules] = await db.execute(`SELECT * FROM tbr_tes_topik WHERE idm_tes = ?`, [idmTes]);
+  if (!rules.length) throw createError('Ujian ini belum punya aturan soal (tes_topik). Hubungi admin.', 400);
+
+  const soalFinal = [];
+
+  for (const rule of rules) {
+    const [soalList] = await db.query(
+      `SELECT idm_soal, soal, media, tipe_soal FROM tbm_soal
+       WHERE idm_topik = ? AND tipe_soal = ? AND is_visible = 1
+       ORDER BY RAND() LIMIT ${Number(rule.jumlah_soal)}`,
+      [rule.idm_topik, rule.tipe_soal],
+    );
+
+    for (const s of soalList) {
+      const item = {
+        idm_soal: s.idm_soal,
+        idm_topik: rule.idm_topik,
+        soal: s.soal,
+        media: s.media,
+        tipe_soal: s.tipe_soal,
+        skor_benar: Number(rule.skor_benar),
+        skor_salah: Number(rule.skor_salah),
+        skor_tidak_jawab: Number(rule.skor_tidak_jawab),
+      };
+
+      if (s.tipe_soal === 'PILIHAN GANDA') {
+        const [pilihan] = await db.execute(
+          `SELECT idm_pilihan, pilihan, media FROM tbm_pilihan
+           WHERE idm_soal = ? AND is_visible = 1 ORDER BY idm_pilihan ASC`,
+          [s.idm_soal],
+        );
+        item.pilihan = rule.acak_pilihan ? shuffle(pilihan) : pilihan;
+      }
+
+      soalFinal.push(item);
+    }
+  }
+
+  return rules[0] && rules.some((r) => r.acak_soal) ? shuffle(soalFinal) : soalFinal;
+};
+
+// ─── Mulai ujian ──────────────────────────────────────────────────────────────
+
+const mulai = async (idmTes, pesertaId, token) => {
+  const [[tes]] = await db.execute(`SELECT * FROM tbm_tes WHERE idm_tes = ? AND is_deleted = 0 LIMIT 1`, [idmTes]);
+  if (!tes) throw createError('Ujian tidak ditemukan.', 404);
+
+  const now = new Date();
+  if (now < new Date(tes.tgl_mulai) || now > new Date(tes.tgl_akhir)) {
+    throw createError('Ujian ini di luar periode waktu yang ditentukan.', 403);
+  }
+
+  const tesGrup = await findTesGrupForPeserta(idmTes, pesertaId);
+  if (!tesGrup) throw createError('Anda tidak terdaftar di grup peserta ujian ini.', 403);
+
+  if (tes.status_token === 1) {
+    if (!token) throw createError('Token akses wajib diisi.', 400);
+    const [[tokenRow]] = await db.execute(
+      `SELECT idm_token FROM tbm_token
+       WHERE idr_tes_grup = ? AND token = ? AND (expired IS NULL OR expired > NOW()) LIMIT 1`,
+      [tesGrup.idr_tes_grup, token],
+    );
+    if (!tokenRow) throw createError('Token akses tidak valid atau sudah kedaluwarsa.', 403);
+  }
+
+  // Attempt yang belum selesai -> lanjutkan, jangan bikin baru
+  const [ongoing] = await db.execute(
+    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? AND status = 1 LIMIT 1`,
+    [idmTes, pesertaId],
+  );
+  if (ongoing.length) return { idh_tes: ongoing[0].idh_tes, resumed: true };
+
+  // Sudah pernah selesai -> tidak boleh ulang (percobaan tunggal untuk saat ini)
+  const [selesai] = await db.execute(
+    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? AND status = 2 LIMIT 1`,
+    [idmTes, pesertaId],
+  );
+  if (selesai.length) throw createError('Anda sudah menyelesaikan ujian ini sebelumnya.', 403);
+
+  const dataSoal = await generateDataSoal(idmTes);
+
+  const [result] = await db.execute(
+    `INSERT INTO tbh_tes (idm_tes, percobaan, data_soal, nilai, waktu_mulai, status, created_by, updated_by)
+     VALUES (?, 1, ?, 0, NOW(), 1, ?, ?)`,
+    [idmTes, JSON.stringify(dataSoal), pesertaId, pesertaId],
+  );
+
+  return { idh_tes: result.insertId, resumed: false };
+};
+
+// ─── Ambil detail attempt (soal + jawaban tersimpan sejauh ini) ──────────────
+
+const getAttempt = async (idhTes, pesertaId) => {
+  const [[attempt]] = await db.execute(
+    `SELECT idh_tes, idm_tes, percobaan, data_soal, waktu_mulai, waktu_akhir, status
+     FROM tbh_tes WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
+    [idhTes, pesertaId],
+  );
+  if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
+
+  const [[tes]] = await db.execute(
+    `SELECT nama_tes, durasi, skor_maksimal FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
+    [attempt.idm_tes],
+  );
+
+  const [jawabanRows] = await db.execute(
+    `SELECT idm_soal, idm_pilihan, jawaban_essai FROM tbh_jawaban WHERE idh_tes = ?`,
+    [idhTes],
+  );
+  const jawabanMap = {};
+  jawabanRows.forEach((j) => { jawabanMap[j.idm_soal] = { idm_pilihan: j.idm_pilihan, jawaban_essai: j.jawaban_essai }; });
+
+  const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+  // Sanitasi — jangan expose skor ke peserta
+  const soalSanitized = dataSoal.map(({ skor_benar, skor_salah, skor_tidak_jawab, ...rest }) => rest);
+
+  const deadline = new Date(new Date(attempt.waktu_mulai).getTime() + tes.durasi * 60 * 1000);
+
+  return {
+    idh_tes: attempt.idh_tes,
+    nama_tes: tes.nama_tes,
+    durasi: tes.durasi,
+    waktu_mulai: attempt.waktu_mulai,
+    deadline,
+    status: attempt.status,
+    soal: soalSanitized,
+    jawaban_saya: jawabanMap,
+  };
+};
+
+// ─── Submit jawaban 1 soal ────────────────────────────────────────────────────
+
+const jawab = async (idhTes, pesertaId, { idm_soal, idm_pilihan, jawaban_essai }) => {
+  const [[attempt]] = await db.execute(
+    `SELECT idh_tes, idm_tes, data_soal, waktu_mulai, status FROM tbh_tes
+     WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
+    [idhTes, pesertaId],
+  );
+  if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
+  if (attempt.status !== 1) throw createError('Ujian ini sudah selesai, tidak bisa menjawab lagi.', 403);
+
+  const [[tes]] = await db.execute(`SELECT durasi FROM tbm_tes WHERE idm_tes = ? LIMIT 1`, [attempt.idm_tes]);
+  const deadline = new Date(new Date(attempt.waktu_mulai).getTime() + tes.durasi * 60 * 1000);
+  if (new Date() > deadline) throw createError('Waktu ujian sudah habis. Selesaikan ujian ini.', 403);
+
+  const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+  const soalDef = dataSoal.find((s) => Number(s.idm_soal) === Number(idm_soal));
+  if (!soalDef) throw createError('Soal tidak ditemukan dalam attempt ini.', 400);
+
+  let nilai = null;
+
+  if (soalDef.tipe_soal === 'PILIHAN GANDA') {
+    if (!idm_pilihan) {
+      nilai = soalDef.skor_tidak_jawab;
+    } else {
+      const [[correct]] = await db.execute(
+        `SELECT idm_pilihan FROM tbm_pilihan WHERE idm_soal = ? AND jawaban = 1 LIMIT 1`,
+        [idm_soal],
+      );
+      nilai = correct && Number(correct.idm_pilihan) === Number(idm_pilihan) ? soalDef.skor_benar : soalDef.skor_salah;
+    }
+  } else if (soalDef.tipe_soal === 'JAWABAN SINGKAT') {
+    const [[soalRow]] = await db.execute(`SELECT jawaban FROM tbm_soal WHERE idm_soal = ? LIMIT 1`, [idm_soal]);
+    const benar = String(soalRow?.jawaban || '').trim().toLowerCase();
+    const jawab_ = String(jawaban_essai || '').trim().toLowerCase();
+    nilai = jawab_ && jawab_ === benar ? soalDef.skor_benar : (jawab_ ? soalDef.skor_salah : soalDef.skor_tidak_jawab);
+  }
+  // ESSAI / SKALA -> nilai tetap null, nunggu dinilai manual oleh admin
+
+  const [existing] = await db.execute(
+    `SELECT idh_jawaban FROM tbh_jawaban WHERE idh_tes = ? AND idm_soal = ? LIMIT 1`,
+    [idhTes, idm_soal],
+  );
+
+  if (existing.length) {
+    await db.execute(
+      `UPDATE tbh_jawaban SET idm_pilihan = ?, jawaban_essai = ?, nilai = ?, updated_by = ?
+       WHERE idh_jawaban = ?`,
+      [idm_pilihan || null, jawaban_essai || null, nilai, pesertaId, existing[0].idh_jawaban],
+    );
+  } else {
+    await db.execute(
+      `INSERT INTO tbh_jawaban (idh_tes, idm_pilihan, idm_soal, jawaban_essai, nilai, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [idhTes, idm_pilihan || null, idm_soal, jawaban_essai || null, nilai, pesertaId, pesertaId],
+    );
+  }
+
+  return { tersimpan: true };
+};
+
+// ─── Hitung ulang nilai total 1 attempt (dipakai selesai() & grading manual) ─
+
+const computeNilai = async (idhTes) => {
+  const [jawaban] = await db.execute(
+    `SELECT idm_soal, nilai FROM tbh_jawaban WHERE idh_tes = ?`,
+    [idhTes],
+  );
+  const total = jawaban.reduce((sum, j) => sum + (Number(j.nilai) || 0), 0);
+  const detail = jawaban.map((j) => ({ idm_soal: j.idm_soal, nilai: j.nilai }));
+
+  await db.execute(`UPDATE tbh_tes SET nilai = ?, detail_nilai = ? WHERE idh_tes = ?`, [
+    total,
+    JSON.stringify(detail),
+    idhTes,
+  ]);
+
+  return total;
+};
+
+// ─── Selesaikan ujian ─────────────────────────────────────────────────────────
+
+const selesai = async (idhTes, pesertaId) => {
+  const [[attempt]] = await db.execute(
+    `SELECT idh_tes, status FROM tbh_tes WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
+    [idhTes, pesertaId],
+  );
+  if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
+  if (attempt.status === 2) throw createError('Ujian ini sudah diselesaikan sebelumnya.', 403);
+
+  await db.execute(
+    `UPDATE tbh_tes SET status = 2, waktu_akhir = NOW(), updated_by = ? WHERE idh_tes = ?`,
+    [pesertaId, idhTes],
+  );
+  const total = await computeNilai(idhTes);
+  return { idh_tes: idhTes, nilai: total };
+};
+
+// ─── Lihat hasil ──────────────────────────────────────────────────────────────
+
+const getHasil = async (idhTes, pesertaId) => {
+  const [[attempt]] = await db.execute(
+    `SELECT idh_tes, idm_tes, nilai, detail_nilai, waktu_mulai, waktu_akhir, status
+     FROM tbh_tes WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
+    [idhTes, pesertaId],
+  );
+  if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
+  if (attempt.status !== 2) throw createError('Ujian belum diselesaikan.', 400);
+
+  const [[tes]] = await db.execute(
+    `SELECT nama_tes, skor_maksimal, status_hasil, status_detail_tes FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
+    [attempt.idm_tes],
+  );
+
+  if (tes.status_hasil !== 1) {
+    return { nama_tes: tes.nama_tes, status: attempt.status, pesan: 'Hasil belum diumumkan oleh admin.' };
+  }
+
+  const result = {
+    nama_tes: tes.nama_tes,
+    skor_maksimal: tes.skor_maksimal,
+    nilai: attempt.nilai,
+    waktu_mulai: attempt.waktu_mulai,
+    waktu_akhir: attempt.waktu_akhir,
+  };
+  if (tes.status_detail_tes === 1) {
+    result.detail_nilai = typeof attempt.detail_nilai === 'string' ? JSON.parse(attempt.detail_nilai) : attempt.detail_nilai;
+  }
+  return result;
+};
+
+module.exports = { getSaya, mulai, getAttempt, jawab, selesai, getHasil, computeNilai };

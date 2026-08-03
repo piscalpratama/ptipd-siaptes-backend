@@ -1,0 +1,14 @@
+// Level user persis sesuai enum kolom tbs_user.level di prod_siaptes.sql
+const LEVELS = {
+  SUPERADMIN: 'SUPERADMIN',
+  ADMIN_SOAL: 'ADMIN - SOAL',
+  ADMIN_TES: 'ADMIN - TES',
+  PESERTA: 'PESERTA',
+};
+
+const ALL_LEVELS = Object.values(LEVELS);
+const ADMIN_LEVELS = [LEVELS.SUPERADMIN, LEVELS.ADMIN_SOAL, LEVELS.ADMIN_TES];
+const SOAL_LEVELS = [LEVELS.SUPERADMIN, LEVELS.ADMIN_SOAL];
+const TES_LEVELS = [LEVELS.SUPERADMIN, LEVELS.ADMIN_TES];
+
+module.exports = { LEVELS, ALL_LEVELS, ADMIN_LEVELS, SOAL_LEVELS, TES_LEVELS };
