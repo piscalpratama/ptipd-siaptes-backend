@@ -40,5 +40,5 @@ spec:
     - name: http
       port: 3100
       targetPort: 3100
-      nodePort: 30317
+      nodePort: 30517
       protocol: TCP
