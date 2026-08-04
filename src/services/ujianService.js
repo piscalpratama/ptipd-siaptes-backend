@@ -350,7 +350,11 @@ const getHasil = async (idhTes, pesertaId) => {
   if (attempt.status !== 2) throw createError('Ujian belum diselesaikan.', 400);
 
   if (tes.status_hasil !== 1) {
-    return { nama_tes: tes.nama_tes, status: attempt.status, pesan: 'Hasil belum diumumkan oleh admin.' };
+    // status_hasil ini toggle ON/OFF biasa di setting tes ("Tampilkan nilai ke
+    // peserta setelah selesai") — BUKAN status "belum diumumkan" yang
+    // menyiratkan bakal muncul nanti. Jangan pakai redaksi menunggu/nanti di
+    // sini, karena admin bisa saja memang sengaja tidak pernah menampilkannya.
+    return { nama_tes: tes.nama_tes, status: attempt.status, pesan: 'Nilai untuk ujian ini tidak ditampilkan kepada peserta.' };
   }
 
   const result = {
