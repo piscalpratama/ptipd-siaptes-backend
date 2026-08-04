@@ -11,6 +11,27 @@ const shuffle = (arr) => {
   return a;
 };
 
+// ─── Auto-finalisasi attempt yang lewat deadline tapi belum "selesai" ────────
+// Kalau peserta tutup tab/koneksi putus pas waktu habis, tidak ada request
+// /selesai yang pernah datang — attempt bisa nyangkut selamanya di status 1
+// ("sedang mengerjakan"). Dipanggil lazy setiap kali attempt itu disentuh
+// lagi (getSaya, getAttempt, jawab, getHasil) dari device/tab MANA PUN, jadi
+// tidak bergantung ke tab browser yang sama masih terbuka pas waktu habis.
+// waktu_akhir dicatat SEBAGAI deadline (bukan NOW()) supaya durasi tercatat
+// tetap akurat sesuai durasi tes, bukan kapan server kebetulan baru nyadar.
+const finalizeIfExpired = async (idhTes, waktuMulai, durasi, status) => {
+  if (status !== 1) return status;
+  const deadline = new Date(new Date(waktuMulai).getTime() + durasi * 60 * 1000);
+  if (new Date() <= deadline) return status;
+
+  const [result] = await db.execute(
+    `UPDATE tbh_tes SET status = 2, waktu_akhir = ? WHERE idh_tes = ? AND status = 1`,
+    [deadline, idhTes],
+  );
+  if (result.affectedRows) await computeNilai(idhTes);
+  return 2;
+};
+
 // ─── Daftar ujian yang tersedia buat peserta ─────────────────────────────────
 
 const getSaya = async (pesertaId) => {
@@ -35,7 +56,11 @@ const getSaya = async (pesertaId) => {
        FROM tbh_tes WHERE idm_tes = ? AND created_by = ? ORDER BY idh_tes DESC LIMIT 1`,
       [tes.idm_tes, pesertaId],
     );
-    tes.attempt = attempts[0] || null;
+    const attempt = attempts[0] || null;
+    if (attempt) {
+      attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+    }
+    tes.attempt = attempt;
   }
 
   return tesList;
@@ -140,13 +165,28 @@ const mulai = async (idmTes, pesertaId, token) => {
 
   const dataSoal = await generateDataSoal(idmTes);
 
-  const [result] = await db.execute(
-    `INSERT INTO tbh_tes (idm_tes, percobaan, data_soal, nilai, waktu_mulai, status, created_by, updated_by)
-     VALUES (?, 1, ?, 0, NOW(), 1, ?, ?)`,
-    [idmTes, JSON.stringify(dataSoal), pesertaId, pesertaId],
-  );
-
-  return { idh_tes: result.insertId, resumed: false };
+  try {
+    const [result] = await db.execute(
+      `INSERT INTO tbh_tes (idm_tes, percobaan, data_soal, nilai, waktu_mulai, status, created_by, updated_by)
+       VALUES (?, 1, ?, 0, NOW(), 1, ?, ?)`,
+      [idmTes, JSON.stringify(dataSoal), pesertaId, pesertaId],
+    );
+    return { idh_tes: result.insertId, resumed: false };
+  } catch (err) {
+    // Race window antara cek "ongoing" di atas dan insert ini (mis. 2 klik
+    // "Mulai Ujian" nyaris bersamaan) — kalau DB tolak karena constraint
+    // uq_tes_ongoing (lihat migration_ujian_race_guard.sql), berarti request
+    // lain sudah menang duluan bikin attempt-nya. Ambil & lanjutkan attempt
+    // itu alih-alih gagal total.
+    if (err.code === 'ER_DUP_ENTRY') {
+      const [race] = await db.execute(
+        `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? AND status = 1 LIMIT 1`,
+        [idmTes, pesertaId],
+      );
+      if (race.length) return { idh_tes: race[0].idh_tes, resumed: true };
+    }
+    throw err;
+  }
 };
 
 // ─── Ambil detail attempt (soal + jawaban tersimpan sejauh ini) ──────────────
@@ -163,6 +203,8 @@ const getAttempt = async (idhTes, pesertaId) => {
     `SELECT nama_tes, durasi, skor_maksimal FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
     [attempt.idm_tes],
   );
+
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
 
   const [jawabanRows] = await db.execute(
     `SELECT idm_soal, idm_pilihan, jawaban_essai FROM tbh_jawaban WHERE idh_tes = ?`,
@@ -198,11 +240,10 @@ const jawab = async (idhTes, pesertaId, { idm_soal, idm_pilihan, jawaban_essai }
     [idhTes, pesertaId],
   );
   if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
-  if (attempt.status !== 1) throw createError('Ujian ini sudah selesai, tidak bisa menjawab lagi.', 403);
 
   const [[tes]] = await db.execute(`SELECT durasi FROM tbm_tes WHERE idm_tes = ? LIMIT 1`, [attempt.idm_tes]);
-  const deadline = new Date(new Date(attempt.waktu_mulai).getTime() + tes.durasi * 60 * 1000);
-  if (new Date() > deadline) throw createError('Waktu ujian sudah habis. Selesaikan ujian ini.', 403);
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+  if (attempt.status !== 1) throw createError('Ujian ini sudah selesai, tidak bisa menjawab lagi.', 403);
 
   const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
   const soalDef = dataSoal.find((s) => Number(s.idm_soal) === Number(idm_soal));
@@ -228,24 +269,17 @@ const jawab = async (idhTes, pesertaId, { idm_soal, idm_pilihan, jawaban_essai }
   }
   // ESSAI / SKALA -> nilai tetap null, nunggu dinilai manual oleh admin
 
-  const [existing] = await db.execute(
-    `SELECT idh_jawaban FROM tbh_jawaban WHERE idh_tes = ? AND idm_soal = ? LIMIT 1`,
-    [idhTes, idm_soal],
+  // Atomic upsert (bukan lagi SELECT-lalu-branch) — mengandalkan UNIQUE
+  // (idh_tes, idm_soal) di migration_ujian_race_guard.sql, jadi 2 request
+  // simpan jawaban nyaris bersamaan untuk soal yang sama tidak bisa lagi
+  // bikin 2 baris atau saling salip tanpa terdeteksi.
+  await db.execute(
+    `INSERT INTO tbh_jawaban (idh_tes, idm_pilihan, idm_soal, jawaban_essai, nilai, created_by, updated_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE idm_pilihan = VALUES(idm_pilihan), jawaban_essai = VALUES(jawaban_essai),
+       nilai = VALUES(nilai), updated_by = VALUES(updated_by)`,
+    [idhTes, idm_pilihan || null, idm_soal, jawaban_essai || null, nilai, pesertaId, pesertaId],
   );
-
-  if (existing.length) {
-    await db.execute(
-      `UPDATE tbh_jawaban SET idm_pilihan = ?, jawaban_essai = ?, nilai = ?, updated_by = ?
-       WHERE idh_jawaban = ?`,
-      [idm_pilihan || null, jawaban_essai || null, nilai, pesertaId, existing[0].idh_jawaban],
-    );
-  } else {
-    await db.execute(
-      `INSERT INTO tbh_jawaban (idh_tes, idm_pilihan, idm_soal, jawaban_essai, nilai, created_by, updated_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [idhTes, idm_pilihan || null, idm_soal, jawaban_essai || null, nilai, pesertaId, pesertaId],
-    );
-  }
 
   return { tersimpan: true };
 };
@@ -296,12 +330,24 @@ const getHasil = async (idhTes, pesertaId) => {
     [idhTes, pesertaId],
   );
   if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
-  if (attempt.status !== 2) throw createError('Ujian belum diselesaikan.', 400);
 
   const [[tes]] = await db.execute(
-    `SELECT nama_tes, skor_maksimal, status_hasil, status_detail_tes FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
+    `SELECT nama_tes, durasi, skor_maksimal, status_hasil, status_detail_tes FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
     [attempt.idm_tes],
   );
+
+  const wasOngoing = attempt.status === 1;
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+  if (wasOngoing && attempt.status === 2) {
+    // Baru saja auto-finalized — nilai/detail_nilai/waktu_akhir di memori
+    // masih data lama (dari sebelum computeNilai jalan), ambil ulang.
+    const [[fresh]] = await db.execute(
+      `SELECT nilai, detail_nilai, waktu_akhir FROM tbh_tes WHERE idh_tes = ? LIMIT 1`,
+      [idhTes],
+    );
+    Object.assign(attempt, fresh);
+  }
+  if (attempt.status !== 2) throw createError('Ujian belum diselesaikan.', 400);
 
   if (tes.status_hasil !== 1) {
     return { nama_tes: tes.nama_tes, status: attempt.status, pesan: 'Hasil belum diumumkan oleh admin.' };
