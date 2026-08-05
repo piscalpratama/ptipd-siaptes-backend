@@ -1,4 +1,4 @@
-// Level user persis sesuai enum kolom tbs_user.level di prod_siaptes.sql
+// Level user persis sesuai enum kolom tbs_user.level di sql/prod_siaptes.sql
 const LEVELS = {
   SUPERADMIN: 'SUPERADMIN',
   ADMIN_SOAL: 'ADMIN - SOAL',

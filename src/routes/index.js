@@ -102,6 +102,16 @@ router.get('/ujian/admin/attempt/:idhTes', authenticate, authorize(...ADMIN_LEVE
 router.put('/ujian/admin/jawaban/:idhJawaban/nilai', authenticate, authorize(...ADMIN_LEVELS), penilaianController.gradeJawaban);
 router.get('/ujian/monitoring/:idmTes', authenticate, authorize(...ADMIN_LEVELS), monitoringController.getMonitoring);
 
+// Aksi kontrol attempt dari halaman Monitoring — sengaja TES_LEVELS (bukan
+// ADMIN_LEVELS penuh) karena ini kontrol langsung ke sesi ujian yang sedang
+// berjalan, lebih sensitif dari sekadar melihat/menilai.
+router.post('/ujian/monitoring/attempt/:idhTes/pause', authenticate, authorize(...TES_LEVELS), monitoringController.pauseAttempt);
+router.post('/ujian/monitoring/attempt/:idhTes/resume', authenticate, authorize(...TES_LEVELS), monitoringController.resumeAttempt);
+router.post('/ujian/monitoring/attempt/:idhTes/stop', authenticate, authorize(...TES_LEVELS), monitoringController.stopAttempt);
+router.post('/ujian/monitoring/attempt/:idhTes/tambah-durasi', authenticate, authorize(...TES_LEVELS), monitoringController.tambahDurasi);
+router.post('/ujian/monitoring/attempt/:idhTes/restart', authenticate, authorize(...TES_LEVELS), monitoringController.restartAttempt);
+router.delete('/ujian/monitoring/attempt/:idhTes', authenticate, authorize(...TES_LEVELS), monitoringController.deleteAttempt);
+
 // ─── Integrasi ICT ────────────────────────────────────────────────────────────
 // POST /integrasi/peserta — dipanggil BE ICT (server-to-server), pakai
 // header x-service-key, BUKAN token JWT user.

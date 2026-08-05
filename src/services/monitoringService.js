@@ -19,7 +19,7 @@ const getMonitoring = async (idmTes) => {
   // banyak 1 baris tbh_tes per peserta per tes).
   const [rows] = await db.query(
     `SELECT u.ids_user, u.nama, u.username,
-            a.idh_tes, a.waktu_mulai, a.waktu_akhir, a.status, a.nilai, a.data_soal
+            a.idh_tes, a.waktu_mulai, a.waktu_akhir, a.status, a.nilai, a.data_soal, a.durasi_tambahan
      FROM (
        SELECT DISTINCT u2.ids_user, u2.nama, u2.username
        FROM tbr_tes_grup tg
@@ -63,8 +63,8 @@ const getMonitoring = async (idmTes) => {
       [r.idh_tes],
     );
 
-    const deadline = new Date(r.waktu_mulai).getTime() + tes.durasi * 60 * 1000;
-    const status = r.status === 2 ? 'selesai' : now > deadline ? 'waktu_habis' : 'sedang';
+    const deadline = new Date(r.waktu_mulai).getTime() + (tes.durasi + Number(r.durasi_tambahan || 0)) * 60 * 1000;
+    const status = r.status === 2 ? 'selesai' : r.status === 3 ? 'dipause' : now > deadline ? 'waktu_habis' : 'sedang';
 
     let statusAktivitas = null;
     if (status === 'sedang') {
@@ -88,6 +88,7 @@ const getMonitoring = async (idmTes) => {
       total_soal: totalSoal,
       sisa_detik: status === 'sedang' ? Math.max(0, Math.round((deadline - now) / 1000)) : null,
       terakhir_aktif,
+      durasi_tambahan: r.durasi_tambahan || 0,
     });
   }
 
@@ -97,6 +98,7 @@ const getMonitoring = async (idmTes) => {
     sedang: peserta.filter((p) => p.status === 'sedang').length,
     aktif: peserta.filter((p) => p.status_aktivitas === 'aktif').length,
     idle: peserta.filter((p) => p.status_aktivitas === 'idle').length,
+    dipause: peserta.filter((p) => p.status === 'dipause').length,
     waktu_habis: peserta.filter((p) => p.status === 'waktu_habis').length,
     selesai: peserta.filter((p) => p.status === 'selesai').length,
   };
