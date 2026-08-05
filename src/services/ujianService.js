@@ -11,6 +11,13 @@ const shuffle = (arr) => {
   return a;
 };
 
+// deadline efektif = waktu_mulai + (durasi tes + durasi_tambahan). Sengaja
+// TIDAK mengubah waktu_mulai buat nambah waktu (lihat adminAddDurasi/
+// adminResume) — waktu_mulai tetap catatan akurat kapan peserta BENERAN
+// mulai, durasi_tambahan yang nampung semua penyesuaian waktu dari admin.
+const computeDeadline = (waktuMulai, durasi, durasiTambahan = 0) =>
+  new Date(new Date(waktuMulai).getTime() + (Number(durasi) + Number(durasiTambahan || 0)) * 60 * 1000);
+
 // ─── Auto-finalisasi attempt yang lewat deadline tapi belum "selesai" ────────
 // Kalau peserta tutup tab/koneksi putus pas waktu habis, tidak ada request
 // /selesai yang pernah datang — attempt bisa nyangkut selamanya di status 1
@@ -19,9 +26,12 @@ const shuffle = (arr) => {
 // tidak bergantung ke tab browser yang sama masih terbuka pas waktu habis.
 // waktu_akhir dicatat SEBAGAI deadline (bukan NOW()) supaya durasi tercatat
 // tetap akurat sesuai durasi tes, bukan kapan server kebetulan baru nyadar.
-const finalizeIfExpired = async (idhTes, waktuMulai, durasi, status) => {
+// Status 3 (dipause) SENGAJA tidak disentuh di sini — attempt yang dipause
+// admin tidak boleh auto-selesai lewat wall-clock, waktunya "beku" sampai
+// admin resume (lihat adminResume).
+const finalizeIfExpired = async (idhTes, waktuMulai, durasi, status, durasiTambahan = 0) => {
   if (status !== 1) return status;
-  const deadline = new Date(new Date(waktuMulai).getTime() + durasi * 60 * 1000);
+  const deadline = computeDeadline(waktuMulai, durasi, durasiTambahan);
   if (new Date() <= deadline) return status;
 
   const [result] = await db.execute(
@@ -52,13 +62,13 @@ const getSaya = async (pesertaId) => {
 
   for (const tes of tesList) {
     const [attempts] = await db.execute(
-      `SELECT idh_tes, percobaan, nilai, waktu_mulai, waktu_akhir, status
+      `SELECT idh_tes, percobaan, nilai, waktu_mulai, waktu_akhir, status, durasi_tambahan
        FROM tbh_tes WHERE idm_tes = ? AND created_by = ? ORDER BY idh_tes DESC LIMIT 1`,
       [tes.idm_tes, pesertaId],
     );
     const attempt = attempts[0] || null;
     if (attempt) {
-      attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+      attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status, attempt.durasi_tambahan);
     }
     tes.attempt = attempt;
   }
@@ -175,7 +185,7 @@ const mulai = async (idmTes, pesertaId, token) => {
   } catch (err) {
     // Race window antara cek "ongoing" di atas dan insert ini (mis. 2 klik
     // "Mulai Ujian" nyaris bersamaan) — kalau DB tolak karena constraint
-    // uq_tes_ongoing (lihat migration_ujian_race_guard.sql), berarti request
+    // uq_tes_ongoing (lihat sql/02_migration_ujian_race_guard.sql), berarti request
     // lain sudah menang duluan bikin attempt-nya. Ambil & lanjutkan attempt
     // itu alih-alih gagal total.
     if (err.code === 'ER_DUP_ENTRY') {
@@ -193,7 +203,7 @@ const mulai = async (idmTes, pesertaId, token) => {
 
 const getAttempt = async (idhTes, pesertaId) => {
   const [[attempt]] = await db.execute(
-    `SELECT idh_tes, idm_tes, percobaan, data_soal, waktu_mulai, waktu_akhir, status
+    `SELECT idh_tes, idm_tes, percobaan, data_soal, waktu_mulai, waktu_akhir, status, durasi_tambahan
      FROM tbh_tes WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
     [idhTes, pesertaId],
   );
@@ -204,7 +214,14 @@ const getAttempt = async (idhTes, pesertaId) => {
     [attempt.idm_tes],
   );
 
-  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status, attempt.durasi_tambahan);
+
+  // Attempt di-pause admin — jangan kirim soal/deadline sama sekali, cukup
+  // status-nya. Frontend nampilin layar blokir penuh + poll berkala nunggu
+  // admin resume, BUKAN timer yang jalan (waktu memang sengaja dibekukan).
+  if (attempt.status === 3) {
+    return { idh_tes: attempt.idh_tes, nama_tes: tes.nama_tes, status: attempt.status };
+  }
 
   const [jawabanRows] = await db.execute(
     `SELECT idm_soal, idm_pilihan, jawaban_essai FROM tbh_jawaban WHERE idh_tes = ?`,
@@ -217,7 +234,7 @@ const getAttempt = async (idhTes, pesertaId) => {
   // Sanitasi — jangan expose skor ke peserta
   const soalSanitized = dataSoal.map(({ skor_benar, skor_salah, skor_tidak_jawab, ...rest }) => rest);
 
-  const deadline = new Date(new Date(attempt.waktu_mulai).getTime() + tes.durasi * 60 * 1000);
+  const deadline = computeDeadline(attempt.waktu_mulai, tes.durasi, attempt.durasi_tambahan);
 
   return {
     idh_tes: attempt.idh_tes,
@@ -235,14 +252,15 @@ const getAttempt = async (idhTes, pesertaId) => {
 
 const jawab = async (idhTes, pesertaId, { idm_soal, idm_pilihan, jawaban_essai }) => {
   const [[attempt]] = await db.execute(
-    `SELECT idh_tes, idm_tes, data_soal, waktu_mulai, status FROM tbh_tes
+    `SELECT idh_tes, idm_tes, data_soal, waktu_mulai, status, durasi_tambahan FROM tbh_tes
      WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
     [idhTes, pesertaId],
   );
   if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
 
   const [[tes]] = await db.execute(`SELECT durasi FROM tbm_tes WHERE idm_tes = ? LIMIT 1`, [attempt.idm_tes]);
-  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status, attempt.durasi_tambahan);
+  if (attempt.status === 3) throw createError('Ujian ini sedang di-pause oleh admin, tidak bisa menjawab dulu.', 403);
   if (attempt.status !== 1) throw createError('Ujian ini sudah selesai, tidak bisa menjawab lagi.', 403);
 
   const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
@@ -270,7 +288,7 @@ const jawab = async (idhTes, pesertaId, { idm_soal, idm_pilihan, jawaban_essai }
   // ESSAI / SKALA -> nilai tetap null, nunggu dinilai manual oleh admin
 
   // Atomic upsert (bukan lagi SELECT-lalu-branch) — mengandalkan UNIQUE
-  // (idh_tes, idm_soal) di migration_ujian_race_guard.sql, jadi 2 request
+  // (idh_tes, idm_soal) di sql/02_migration_ujian_race_guard.sql, jadi 2 request
   // simpan jawaban nyaris bersamaan untuk soal yang sama tidak bisa lagi
   // bikin 2 baris atau saling salip tanpa terdeteksi.
   await db.execute(
@@ -325,7 +343,7 @@ const selesai = async (idhTes, pesertaId) => {
 
 const getHasil = async (idhTes, pesertaId) => {
   const [[attempt]] = await db.execute(
-    `SELECT idh_tes, idm_tes, nilai, detail_nilai, waktu_mulai, waktu_akhir, status
+    `SELECT idh_tes, idm_tes, nilai, detail_nilai, waktu_mulai, waktu_akhir, status, durasi_tambahan, data_soal
      FROM tbh_tes WHERE idh_tes = ? AND created_by = ? LIMIT 1`,
     [idhTes, pesertaId],
   );
@@ -337,7 +355,7 @@ const getHasil = async (idhTes, pesertaId) => {
   );
 
   const wasOngoing = attempt.status === 1;
-  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status);
+  attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status, attempt.durasi_tambahan);
   if (wasOngoing && attempt.status === 2) {
     // Baru saja auto-finalized — nilai/detail_nilai/waktu_akhir di memori
     // masih data lama (dari sebelum computeNilai jalan), ambil ulang.
@@ -354,7 +372,23 @@ const getHasil = async (idhTes, pesertaId) => {
     // peserta setelah selesai") — BUKAN status "belum diumumkan" yang
     // menyiratkan bakal muncul nanti. Jangan pakai redaksi menunggu/nanti di
     // sini, karena admin bisa saja memang sengaja tidak pernah menampilkannya.
-    return { nama_tes: tes.nama_tes, status: attempt.status, pesan: 'Nilai untuk ujian ini tidak ditampilkan kepada peserta.' };
+    // Nilai memang disembunyikan, tapi info non-nilai (jadwal pengerjaan,
+    // jumlah soal terjawab) tetap ditampilkan supaya peserta yakin ujiannya
+    // benar-benar sudah tercatat selesai di server.
+    const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+    const [[{ jumlah_dijawab }]] = await db.execute(
+      `SELECT COUNT(*) as jumlah_dijawab FROM tbh_jawaban WHERE idh_tes = ?`,
+      [idhTes],
+    );
+    return {
+      nama_tes: tes.nama_tes,
+      status: attempt.status,
+      waktu_mulai: attempt.waktu_mulai,
+      waktu_akhir: attempt.waktu_akhir,
+      jumlah_dijawab,
+      total_soal: dataSoal.length,
+      pesan: 'Nilai untuk ujian ini tidak ditampilkan kepada peserta.',
+    };
   }
 
   const result = {
@@ -370,4 +404,108 @@ const getHasil = async (idhTes, pesertaId) => {
   return result;
 };
 
-module.exports = { getSaya, mulai, getAttempt, jawab, selesai, getHasil, computeNilai };
+// ═══ Admin: kontrol attempt dari halaman Monitoring ══════════════════════════
+// Semua fungsi di bawah ini dipicu admin (bukan peserta sendiri), dipakai di
+// halaman Monitoring buat: Pause, Lanjutkan, Hentikan, Tambah Durasi, Mulai
+// Ulang, Hapus. Tidak ada cek `created_by = pesertaId` di sini karena
+// caller-nya memang admin, bukan peserta ybs — ownership by pesertaId hanya
+// relevan buat endpoint yang dipanggil peserta sendiri (mulai/jawab/dst).
+
+// ─── Pause — bekukan waktu & tolak jawaban sampai di-resume ─────────────────
+const adminPause = async (idhTes, adminId) => {
+  const [result] = await db.execute(
+    `UPDATE tbh_tes SET status = 3, paused_at = NOW(), updated_by = ? WHERE idh_tes = ? AND status = 1`,
+    [adminId, idhTes],
+  );
+  if (!result.affectedRows) {
+    throw createError('Attempt ini tidak sedang berjalan, tidak bisa di-pause.', 409);
+  }
+};
+
+// ─── Resume — lanjutkan attempt yang di-pause, kompensasi lama pause-nya ────
+// ke durasi_tambahan supaya sisa waktu peserta PERSIS sama seperti sebelum
+// di-pause (bukan langsung dianggap habis begitu status balik ke 1).
+const adminResume = async (idhTes, adminId) => {
+  const [[attempt]] = await db.execute(
+    `SELECT status, paused_at FROM tbh_tes WHERE idh_tes = ? LIMIT 1`,
+    [idhTes],
+  );
+  if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
+  if (attempt.status !== 3) throw createError('Attempt ini tidak sedang di-pause.', 409);
+
+  const pausedSeconds = Math.max(0, Math.round((Date.now() - new Date(attempt.paused_at).getTime()) / 1000));
+  const pausedMinutes = Math.ceil(pausedSeconds / 60); // dibulatkan ke atas, jangan sampai peserta rugi detik
+
+  await db.execute(
+    `UPDATE tbh_tes SET status = 1, paused_at = NULL, durasi_tambahan = durasi_tambahan + ?, updated_by = ?
+     WHERE idh_tes = ?`,
+    [pausedMinutes, adminId, idhTes],
+  );
+};
+
+// ─── Hentikan paksa — selesaikan attempt sekarang juga apa pun statusnya ────
+const adminStop = async (idhTes, adminId) => {
+  const [[attempt]] = await db.execute(`SELECT status FROM tbh_tes WHERE idh_tes = ? LIMIT 1`, [idhTes]);
+  if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
+  if (attempt.status === 2) throw createError('Attempt ini sudah selesai.', 409);
+
+  await db.execute(
+    `UPDATE tbh_tes SET status = 2, waktu_akhir = NOW(), paused_at = NULL, updated_by = ? WHERE idh_tes = ?`,
+    [adminId, idhTes],
+  );
+  await computeNilai(idhTes);
+};
+
+// ─── Tambah durasi — perpanjang deadline attempt INI SAJA (bukan tes-nya) ───
+const adminAddDurasi = async (idhTes, menitTambahan, adminId) => {
+  const [[attempt]] = await db.execute(`SELECT status FROM tbh_tes WHERE idh_tes = ? LIMIT 1`, [idhTes]);
+  if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
+  if (attempt.status === 2) throw createError('Attempt ini sudah selesai, tidak bisa ditambah durasi.', 409);
+
+  await db.execute(
+    `UPDATE tbh_tes SET durasi_tambahan = durasi_tambahan + ?, updated_by = ? WHERE idh_tes = ?`,
+    [menitTambahan, adminId, idhTes],
+  );
+};
+
+// ─── Mulai ulang — reset attempt jadi kondisi baru mulai, hapus jawaban lama ─
+// Soal (data_soal) sengaja DIPERTAHANKAN (bukan di-random ulang) supaya set
+// soal yang dilihat admin/proctor konsisten dengan yang sudah dijelaskan ke
+// peserta sebelum masalah teknis terjadi.
+const adminRestart = async (idhTes, adminId) => {
+  const [[attempt]] = await db.execute(`SELECT idh_tes FROM tbh_tes WHERE idh_tes = ? LIMIT 1`, [idhTes]);
+  if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
+
+  await db.execute(`DELETE FROM tbh_jawaban WHERE idh_tes = ?`, [idhTes]);
+  await db.execute(
+    `UPDATE tbh_tes SET status = 1, waktu_mulai = NOW(), waktu_akhir = NULL, paused_at = NULL,
+       durasi_tambahan = 0, nilai = 0, detail_nilai = NULL, updated_by = ?
+     WHERE idh_tes = ?`,
+    [adminId, idhTes],
+  );
+};
+
+// ─── Hapus — buang attempt total, peserta bisa "Mulai Ujian" dari nol lagi ──
+const adminDelete = async (idhTes) => {
+  const [[attempt]] = await db.execute(`SELECT idh_tes FROM tbh_tes WHERE idh_tes = ? LIMIT 1`, [idhTes]);
+  if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
+
+  await db.execute(`DELETE FROM tbh_jawaban WHERE idh_tes = ?`, [idhTes]);
+  await db.execute(`DELETE FROM tbh_tes WHERE idh_tes = ?`, [idhTes]);
+};
+
+module.exports = {
+  getSaya,
+  mulai,
+  getAttempt,
+  jawab,
+  selesai,
+  getHasil,
+  computeNilai,
+  adminPause,
+  adminResume,
+  adminStop,
+  adminAddDurasi,
+  adminRestart,
+  adminDelete,
+};

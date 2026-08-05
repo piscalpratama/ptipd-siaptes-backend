@@ -2,6 +2,16 @@ const db = require('../config/db');
 const { parsePagination, buildPaginationMeta } = require('../config/pagination');
 const { createError } = require('../middleware/errorHandler');
 
+// tgl_mulai/tgl_akhir dikirim frontend sebagai string ISO naive (tanpa
+// Z/offset, mis. "2026-08-05T14:00:00") yang dimaksudkan sebagai jam
+// Jakarta apa adanya. JANGAN dibungkus new Date(...) — itu bikin string
+// naive di-parse pakai timezone proses Node (default UTC di container),
+// lalu mysql2 (timezone: '+07:00') menggeser lagi +7 jam saat insert ke
+// kolom DATETIME, hasilnya waktu tersimpan maju +7 jam dari yang diinput
+// admin. Kolomnya DATETIME polos, jadi cukup diteruskan sebagai string
+// SQL datetime biasa tanpa lewat Date object sama sekali.
+const toSqlDatetime = (isoLike) => isoLike.replace('T', ' ').slice(0, 19);
+
 const getAll = async (query) => {
   const { page, limit, offset } = parsePagination(query);
   const { search, tgl_dari, tgl_sampai } = query;
@@ -63,8 +73,8 @@ const create = async (data, userId) => {
     [
       nama_tes,
       keterangan || '',
-      new Date(tgl_mulai),
-      new Date(tgl_akhir),
+      toSqlDatetime(tgl_mulai),
+      toSqlDatetime(tgl_akhir),
       durasi,
       skor_maksimal,
       status_hasil ?? 1,
@@ -91,7 +101,7 @@ const update = async (id, data, userId) => {
   allowed.forEach((k) => {
     if (data[k] !== undefined) {
       fields.push(`${k} = ?`);
-      params.push(dateFields.has(k) ? new Date(data[k]) : data[k]);
+      params.push(dateFields.has(k) ? toSqlDatetime(data[k]) : data[k]);
     }
   });
   if (!fields.length) throw createError('Tidak ada data yang diperbarui.', 400);
