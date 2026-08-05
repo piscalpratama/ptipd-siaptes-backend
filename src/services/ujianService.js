@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const { createError } = require('../middleware/errorHandler');
 const { parseGrupIds } = require('../utils/grupUtil');
+const { pickMinimalOvershoot } = require('../utils/subsetSum');
 
 const shuffle = (arr) => {
   const a = [...arr];
@@ -494,6 +495,120 @@ const adminDelete = async (idhTes) => {
   await db.execute(`DELETE FROM tbh_tes WHERE idh_tes = ?`, [idhTes]);
 };
 
+// ═══ Intervensi manual (DEVELOPMENT, dipicu server-to-server dari ICT) ══════
+// Dipakai buat "meluluskan" peserta susulan yang tidak ikut ujian SIAPTES
+// beneran — bikin 1 attempt LENGKAP (bukan cuma nilai ditulis manual) supaya
+// datanya tidak jomplang dibanding peserta yang beneran ujian. Jawaban
+// SENGAJA dibias (bukan full random) supaya nilai akhirnya >= target yang
+// diminta ICT, pakai skor dari aturan topik (skor_benar/skor_salah) — bukan
+// angka ditulis langsung. SELALU menimpa attempt lama kalau ada (keputusan
+// sadar, lihat plan/diskusi) — dan HANYA untuk ujian yang semua soalnya
+// PILIHAN GANDA (esai butuh penilaian manual, tidak bisa diotomatisasi aman).
+const adminLuluskanManual = async ({ idmGrup, nim, targetNilai }, adminUserId) => {
+  const [[user]] = await db.execute(`SELECT ids_user FROM tbs_user WHERE username = ? LIMIT 1`, [nim]);
+  if (!user) throw createError('Peserta (NIM) tidak ditemukan di SIAPTES.', 404);
+
+  // Resolve ujian aktif untuk grup ini — utamakan yang sedang dalam periode,
+  // fallback ke yang paling baru kalau tidak ada yang sedang aktif.
+  const [[tes]] = await db.query(
+    `SELECT t.* FROM tbr_tes_grup rg JOIN tbm_tes t ON rg.idm_tes = t.idm_tes
+     WHERE rg.idm_grup = ? AND t.is_deleted = 0
+     ORDER BY (NOW() BETWEEN t.tgl_mulai AND t.tgl_akhir) DESC, t.tgl_mulai DESC LIMIT 1`,
+    [idmGrup],
+  );
+  if (!tes) throw createError('Ujian untuk grup ini tidak ditemukan di SIAPTES.', 404);
+
+  const [topikRules] = await db.execute(`SELECT tipe_soal FROM tbr_tes_topik WHERE idm_tes = ?`, [tes.idm_tes]);
+  if (!topikRules.length) throw createError('Ujian ini belum punya aturan soal (tes_topik).', 400);
+  if (topikRules.some((r) => r.tipe_soal !== 'PILIHAN GANDA')) {
+    throw createError('Ujian ini punya tipe soal selain Pilihan Ganda — tidak bisa diintervensi otomatis.', 422);
+  }
+
+  // Selalu timpa attempt lama kalau ada (keputusan sadar — lihat komentar di atas)
+  const [[existing]] = await db.execute(
+    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? LIMIT 1`,
+    [tes.idm_tes, user.ids_user],
+  );
+  if (existing) {
+    await db.execute(`DELETE FROM tbh_jawaban WHERE idh_tes = ?`, [existing.idh_tes]);
+    await db.execute(`DELETE FROM tbh_tes WHERE idh_tes = ?`, [existing.idh_tes]);
+  }
+
+  const soalList = await generateDataSoal(tes.idm_tes);
+  if (!soalList.length) throw createError('Tidak ada soal tersedia untuk ujian ini.', 400);
+
+  // Per soal: cari opsi yang benar (flag jawaban=1, sama seperti jawab()) dan
+  // satu opsi lain sebagai kandidat "salah".
+  const enriched = [];
+  for (const s of soalList) {
+    const [[correct]] = await db.execute(
+      `SELECT idm_pilihan FROM tbm_pilihan WHERE idm_soal = ? AND jawaban = 1 LIMIT 1`,
+      [s.idm_soal],
+    );
+    const [wrongCandidates] = await db.execute(
+      `SELECT idm_pilihan FROM tbm_pilihan WHERE idm_soal = ? AND is_visible = 1 AND idm_pilihan != ? LIMIT 1`,
+      [s.idm_soal, correct?.idm_pilihan ?? 0],
+    );
+    enriched.push({
+      idm_soal: s.idm_soal,
+      skor_benar: s.skor_benar,
+      skor_salah: s.skor_salah,
+      correctPilihan: correct?.idm_pilihan ?? null,
+      // Kalau soal ini cuma punya 1 opsi (tidak ada kandidat "salah"), tidak
+      // ada cara jawab salah — paksa selalu benar buat soal ini.
+      wrongPilihan: wrongCandidates[0]?.idm_pilihan ?? correct?.idm_pilihan ?? null,
+    });
+  }
+
+  // baseline = semua soal dijawab SALAH; deltas = keuntungan kalau soal itu
+  // dijawab BENAR. DP cari subset soal-benar dengan overshoot paling minimal
+  // dari targetNilai (lihat utils/subsetSum.js).
+  const baseline = enriched.reduce((sum, s) => sum + s.skor_salah, 0);
+  const needed = targetNilai - baseline;
+  const chosenCorrectIdx = pickMinimalOvershoot(
+    enriched.map((s) => s.skor_benar - s.skor_salah),
+    needed,
+  );
+
+  let nilaiFinal = baseline;
+  const jawabanRows = enriched.map((s, i) => {
+    const isCorrect = chosenCorrectIdx.has(i);
+    if (isCorrect) nilaiFinal += s.skor_benar - s.skor_salah;
+    return {
+      idm_soal: s.idm_soal,
+      idm_pilihan: isCorrect ? s.correctPilihan : s.wrongPilihan,
+      nilai: isCorrect ? s.skor_benar : s.skor_salah,
+    };
+  });
+
+  // Waktu masuk akal — di-clamp dalam periode aktif ujian, durasi sesuai durasi tes
+  const durasiMs = Number(tes.durasi) * 60000;
+  const waktuAkhir = new Date(Math.min(Date.now(), new Date(tes.tgl_akhir).getTime()));
+  const waktuMulai = new Date(Math.max(new Date(tes.tgl_mulai).getTime(), waktuAkhir.getTime() - durasiMs));
+
+  const [insertTes] = await db.execute(
+    `INSERT INTO tbh_tes (idm_tes, data_soal, waktu_mulai, waktu_akhir, status, nilai, created_by, updated_by)
+     VALUES (?, ?, ?, ?, 2, ?, ?, ?)`,
+    [tes.idm_tes, JSON.stringify(soalList), waktuMulai, waktuAkhir, nilaiFinal, user.ids_user, adminUserId],
+  );
+  const idhTes = insertTes.insertId;
+
+  for (const j of jawabanRows) {
+    await db.execute(
+      `INSERT INTO tbh_jawaban (idh_tes, idm_soal, idm_pilihan, nilai, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [idhTes, j.idm_soal, j.idm_pilihan, j.nilai, user.ids_user, adminUserId],
+    );
+  }
+
+  await db.execute(`UPDATE tbh_tes SET detail_nilai = ? WHERE idh_tes = ?`, [
+    JSON.stringify(jawabanRows.map(({ idm_soal, nilai }) => ({ idm_soal, nilai }))),
+    idhTes,
+  ]);
+
+  return { idh_tes: idhTes, idm_tes: tes.idm_tes, nama_tes: tes.nama_tes, nilai: nilaiFinal };
+};
+
 module.exports = {
   getSaya,
   mulai,
@@ -508,4 +623,5 @@ module.exports = {
   adminAddDurasi,
   adminRestart,
   adminDelete,
+  adminLuluskanManual,
 };
