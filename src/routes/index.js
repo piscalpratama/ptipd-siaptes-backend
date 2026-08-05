@@ -121,6 +121,11 @@ router.post('/integrasi/peserta', serviceAuth, integrasiController.pushPeserta);
 // sync-kan idm_grup hasilnya ke siaptes_idm_grup di tbl_setting_kelas.
 router.post('/integrasi/grup', serviceAuth, integrasiController.upsertGrup);
 
+// POST /integrasi/luluskan-manual — dipanggil BE ICT (DEVELOPMENT-only di
+// sisi ICT) buat bikin attempt ujian manual/intervensi susulan tanpa peserta
+// beneran ikut ujian. Lihat ujianService.adminLuluskanManual.
+router.post('/integrasi/luluskan-manual', serviceAuth, integrasiController.luluskanManual);
+
 // GET /tes-grup/histori — kontrak LAMA yang sudah dipakai syncNilaiService.js
 // di BE ICT tanpa auth header sama sekali. Sengaja dibiarkan publik supaya
 // tidak breaking change — kalau mau diamankan, update dulu pemanggilnya di
