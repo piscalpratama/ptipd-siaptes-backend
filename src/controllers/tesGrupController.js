@@ -50,4 +50,39 @@ const revokeToken = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
-module.exports = { listByTes, addGrup, removeGrup, listToken, generateToken, revokeToken };
+// ─── Token per-tes (berlaku sama untuk semua grup di ujian itu) ──────────────
+
+const listTesToken = async (req, res, next) => {
+  try {
+    const data = await tesGrupService.listTokenForTes(req.params.idmTes);
+    return res.success(data, 'Data token ujian berhasil diambil.');
+  } catch (err) { next(err); }
+};
+
+const generateTesToken = async (req, res, next) => {
+  try {
+    const { error, value } = tokenSchema.validate(req.body, { abortEarly: false });
+    if (error) return next(Object.assign(error, { isJoi: true }));
+    const result = await tesGrupService.generateTokenForTes(req.params.idmTes, value.expired_minutes, req.user.user_id);
+    return res.success(result, 'Token ujian berhasil dibuat.', 201);
+  } catch (err) { next(err); }
+};
+
+const revokeTesToken = async (req, res, next) => {
+  try {
+    await tesGrupService.revokeTokenForTes(req.params.idmTes, req.params.token);
+    return res.success(null, 'Token ujian berhasil dicabut.');
+  } catch (err) { next(err); }
+};
+
+module.exports = {
+  listByTes,
+  addGrup,
+  removeGrup,
+  listToken,
+  generateToken,
+  revokeToken,
+  listTesToken,
+  generateTesToken,
+  revokeTesToken,
+};
