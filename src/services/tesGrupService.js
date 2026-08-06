@@ -71,4 +71,61 @@ const revokeToken = async (idmToken) => {
   await db.execute(`DELETE FROM tbm_token WHERE idm_token = ?`, [idmToken]);
 };
 
-module.exports = { listByTes, addGrup, removeGrup, listToken, generateToken, revokeToken };
+// ─── Token per-tes (berlaku sama untuk SEMUA grup di ujian itu) ───────────────
+// tbm_token secara skema tetap scoped per idr_tes_grup (tidak ada kolom
+// idm_tes) — token "per tes" diimplementasikan dengan menyisipkan STRING
+// TOKEN YANG SAMA ke setiap baris idr_tes_grup milik tes tsb sekaligus.
+// Validasi di ujianService.mulai() tidak perlu berubah sama sekali, karena
+// tetap mencocokkan token terhadap idr_tes_grup milik peserta seperti biasa
+// — cuma sekarang beberapa grup punya baris token dengan nilai token yang
+// identik.
+const generateTokenForTes = async (idmTes, expiredMinutes, userId) => {
+  const [grupRows] = await db.execute(`SELECT idr_tes_grup FROM tbr_tes_grup WHERE idm_tes = ?`, [idmTes]);
+  if (!grupRows.length) throw createError('Ujian ini belum punya grup peserta.', 400);
+
+  const token = generateTokenString();
+  const expiredAt = expiredMinutes ? new Date(Date.now() + expiredMinutes * 60 * 1000) : null;
+
+  for (const g of grupRows) {
+    await db.execute(
+      `INSERT INTO tbm_token (idr_tes_grup, token, expired, created_by, updated_by) VALUES (?, ?, ?, ?, ?)`,
+      [g.idr_tes_grup, token, expiredAt, userId, userId],
+    );
+  }
+  return { token, expired: expiredAt, jumlah_grup: grupRows.length };
+};
+
+const listTokenForTes = async (idmTes) => {
+  const [rows] = await db.execute(
+    `SELECT t.token, MAX(t.expired) as expired, MIN(t.created_at) as created_at, COUNT(*) as jumlah_grup
+     FROM tbm_token t
+     JOIN tbr_tes_grup tg ON tg.idr_tes_grup = t.idr_tes_grup
+     WHERE tg.idm_tes = ?
+     GROUP BY t.token
+     ORDER BY created_at DESC`,
+    [idmTes],
+  );
+  return rows;
+};
+
+const revokeTokenForTes = async (idmTes, token) => {
+  const [result] = await db.execute(
+    `DELETE t FROM tbm_token t
+     JOIN tbr_tes_grup tg ON tg.idr_tes_grup = t.idr_tes_grup
+     WHERE tg.idm_tes = ? AND t.token = ?`,
+    [idmTes, token],
+  );
+  if (!result.affectedRows) throw createError('Token tidak ditemukan.', 404);
+};
+
+module.exports = {
+  listByTes,
+  addGrup,
+  removeGrup,
+  listToken,
+  generateToken,
+  revokeToken,
+  generateTokenForTes,
+  listTokenForTes,
+  revokeTokenForTes,
+};

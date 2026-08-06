@@ -7,6 +7,7 @@ const { ALL_LEVELS, ADMIN_LEVELS, SOAL_LEVELS, TES_LEVELS, LEVELS } = require('.
 
 const authController = require('../controllers/authController');
 const userController = require('../controllers/userController');
+const statistikController = require('../controllers/statistikController');
 const modulController = require('../controllers/modulController');
 const topikController = require('../controllers/topikController');
 const soalController = require('../controllers/soalController');
@@ -35,6 +36,8 @@ router.get('/users/:id', authenticate, authorize(LEVELS.SUPERADMIN), userControl
 router.post('/users', authenticate, authorize(LEVELS.SUPERADMIN), userController.create);
 router.put('/users/:id', authenticate, authorize(LEVELS.SUPERADMIN), userController.update);
 router.delete('/users/:id', authenticate, authorize(LEVELS.SUPERADMIN), userController.remove);
+
+router.get('/statistik', authenticate, authorize(LEVELS.SUPERADMIN), statistikController.get);
 
 // ─── Modul (ADMIN - SOAL) ─────────────────────────────────────────────────────
 router.get('/modul', authenticate, authorize(...ADMIN_LEVELS), modulController.getAll);
@@ -81,6 +84,12 @@ router.delete('/tes-grup/:idrTesGrup', authenticate, authorize(...TES_LEVELS), t
 router.get('/tes-grup/:idrTesGrup/token', authenticate, authorize(...ADMIN_LEVELS), tesGrupController.listToken);
 router.post('/tes-grup/:idrTesGrup/token', authenticate, authorize(...TES_LEVELS), tesGrupController.generateToken);
 router.delete('/token/:idmToken', authenticate, authorize(...TES_LEVELS), tesGrupController.revokeToken);
+
+// Token per-tes — berlaku sama untuk SEMUA grup ujian tsb sekaligus (lihat
+// catatan di tesGrupService.generateTokenForTes soal implementasinya).
+router.get('/tes/:idmTes/token', authenticate, authorize(...ADMIN_LEVELS), tesGrupController.listTesToken);
+router.post('/tes/:idmTes/token', authenticate, authorize(...TES_LEVELS), tesGrupController.generateTesToken);
+router.delete('/tes/:idmTes/token/:token', authenticate, authorize(...TES_LEVELS), tesGrupController.revokeTesToken);
 
 // ─── Tes ↔ Topik (aturan generate soal) ──────────────────────────────────────
 router.get('/tes/:idmTes/topik', authenticate, authorize(...ADMIN_LEVELS), tesTopikController.listByTes);
