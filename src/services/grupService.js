@@ -3,15 +3,24 @@ const db = require('../config/db');
 const { parsePagination, buildPaginationMeta } = require('../config/pagination');
 const { createError } = require('../middleware/errorHandler');
 const { addGrupId, removeGrupId } = require('../utils/grupUtil');
+const { buildOrderBy } = require('../utils/buildOrderBy');
+
+const GRUP_SORT = {
+  nama_asc: 'nama_grup ASC',
+  nama_desc: 'nama_grup DESC',
+  terbaru: 'idm_grup DESC',
+  terlama: 'idm_grup ASC',
+};
 
 const getAll = async (query) => {
   const { page, limit, offset } = parsePagination(query);
-  const { search } = query;
+  const { search, sort } = query;
 
   const conditions = [];
   const params = [];
   if (search) { conditions.push('nama_grup LIKE ?'); params.push(`%${search}%`); }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const orderBy = buildOrderBy(sort, GRUP_SORT, 'idm_grup DESC');
 
   const [[{ total }]] = await db.execute(
     `SELECT COUNT(*) as total FROM tbm_grup ${where}`,
@@ -19,7 +28,7 @@ const getAll = async (query) => {
   );
   const [rows] = await db.query(
     `SELECT idm_grup, nama_grup, created_by, updated_by, created_at, updated_at
-     FROM tbm_grup ${where} ORDER BY idm_grup DESC LIMIT ${limit} OFFSET ${offset}`,
+     FROM tbm_grup ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
     params,
   );
 

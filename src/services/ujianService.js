@@ -2,6 +2,7 @@ const db = require('../config/db');
 const { createError } = require('../middleware/errorHandler');
 const { parseGrupIds } = require('../utils/grupUtil');
 const { pickMinimalOvershoot } = require('../utils/subsetSum');
+const { hydrateDataSoal } = require('../utils/hydrateSoal');
 
 const shuffle = (arr) => {
   const a = [...arr];
@@ -53,7 +54,7 @@ const getSaya = async (pesertaId) => {
   const placeholders = grupIds.map(() => '?').join(',');
   const [tesList] = await db.query(
     `SELECT DISTINCT t.idm_tes, t.nama_tes, t.keterangan, t.tgl_mulai, t.tgl_akhir,
-            t.durasi, t.skor_maksimal, t.status_hasil, t.status_token
+            t.durasi, t.skor_maksimal, t.max_percobaan, t.status_hasil, t.status_token
      FROM tbr_tes_grup rg
      JOIN tbm_tes t ON rg.idm_tes = t.idm_tes
      WHERE rg.idm_grup IN (${placeholders}) AND t.is_deleted = 0
@@ -64,14 +65,28 @@ const getSaya = async (pesertaId) => {
   for (const tes of tesList) {
     const [attempts] = await db.execute(
       `SELECT idh_tes, percobaan, nilai, waktu_mulai, waktu_akhir, status, durasi_tambahan
-       FROM tbh_tes WHERE idm_tes = ? AND created_by = ? ORDER BY idh_tes DESC LIMIT 1`,
+       FROM tbh_tes WHERE idm_tes = ? AND created_by = ? ORDER BY percobaan ASC`,
       [tes.idm_tes, pesertaId],
     );
-    const attempt = attempts[0] || null;
-    if (attempt) {
-      attempt.status = await finalizeIfExpired(attempt.idh_tes, attempt.waktu_mulai, tes.durasi, attempt.status, attempt.durasi_tambahan);
+
+    const ongoing = attempts.find((a) => a.status === 1);
+    // `attempt` dipertahankan sebagai field tunggal (kontrak lama yang
+    // sudah dipakai dashboard) — prioritas attempt yang sedang berjalan,
+    // else attempt PALING TERAKHIR (bukan yang nilainya terbaik, supaya
+    // "Lihat Hasil" nunjukkin percobaan terbaru, bukan membingungkan).
+    const current = ongoing || attempts[attempts.length - 1] || null;
+    if (current) {
+      current.status = await finalizeIfExpired(current.idh_tes, current.waktu_mulai, tes.durasi, current.status, current.durasi_tambahan);
     }
-    tes.attempt = attempt;
+
+    const finishedAttempts = attempts.filter((a) => a.status === 2);
+    const bestNilai = finishedAttempts.length ? Math.max(...finishedAttempts.map((a) => a.nilai)) : null;
+
+    tes.attempt = current;
+    tes.jumlah_percobaan = finishedAttempts.length;
+    tes.nilai_terbaik = bestNilai;
+    tes.bisa_coba_lagi = !ongoing && bestNilai !== null && bestNilai < tes.skor_maksimal &&
+      (tes.max_percobaan == null || finishedAttempts.length < tes.max_percobaan);
   }
 
   return tesList;
@@ -109,11 +124,13 @@ const generateDataSoal = async (idmTes) => {
     );
 
     for (const s of soalList) {
+      // Bentuk RINGKAS SENGAJA — cuma simpan idm_soal + skor + urutan
+      // pilihan yang diacak (attempt-specific), BUKAN teks soal/pilihan
+      // (itu duplikasi master data tbm_soal/tbm_pilihan yang bikin
+      // tbh_tes bengkak ke ukuran GB). Teks direhidrasi via JOIN saat
+      // dibaca — lihat src/utils/hydrateSoal.js.
       const item = {
         idm_soal: s.idm_soal,
-        idm_topik: rule.idm_topik,
-        soal: s.soal,
-        media: s.media,
         tipe_soal: s.tipe_soal,
         skor_benar: Number(rule.skor_benar),
         skor_salah: Number(rule.skor_salah),
@@ -122,11 +139,12 @@ const generateDataSoal = async (idmTes) => {
 
       if (s.tipe_soal === 'PILIHAN GANDA') {
         const [pilihan] = await db.execute(
-          `SELECT idm_pilihan, pilihan, media FROM tbm_pilihan
+          `SELECT idm_pilihan FROM tbm_pilihan
            WHERE idm_soal = ? AND is_visible = 1 ORDER BY idm_pilihan ASC`,
           [s.idm_soal],
         );
-        item.pilihan = rule.acak_pilihan ? shuffle(pilihan) : pilihan;
+        const ordered = rule.acak_pilihan ? shuffle(pilihan) : pilihan;
+        item.pilihan_order = ordered.map((p) => p.idm_pilihan);
       }
 
       soalFinal.push(item);
@@ -167,20 +185,32 @@ const mulai = async (idmTes, pesertaId, token) => {
   );
   if (ongoing.length) return { idh_tes: ongoing[0].idh_tes, resumed: true };
 
-  // Sudah pernah selesai -> tidak boleh ulang (percobaan tunggal untuk saat ini)
-  const [selesai] = await db.execute(
-    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? AND status = 2 LIMIT 1`,
+  // Sudah pernah selesai -> boleh coba lagi SELAMA belum capai nilai
+  // maksimal DAN belum mentok batas percobaan (kalau ada). Nilai final yang
+  // dipakai sync ke ICT selalu yang TERTINGGI dari semua percobaan (lihat
+  // integrasiService.getHistori), bukan cuma percobaan terakhir.
+  const [finished] = await db.execute(
+    `SELECT nilai FROM tbh_tes WHERE idm_tes = ? AND created_by = ? AND status = 2`,
     [idmTes, pesertaId],
   );
-  if (selesai.length) throw createError('Anda sudah menyelesaikan ujian ini sebelumnya.', 403);
+  if (finished.length) {
+    const bestNilai = Math.max(...finished.map((f) => f.nilai));
+    if (bestNilai >= tes.skor_maksimal) {
+      throw createError(`Anda sudah mencapai nilai maksimal (${bestNilai}/${tes.skor_maksimal}) pada percobaan sebelumnya.`, 403);
+    }
+    if (tes.max_percobaan != null && finished.length >= tes.max_percobaan) {
+      throw createError(`Anda sudah mencapai batas maksimal ${tes.max_percobaan}x percobaan untuk ujian ini.`, 403);
+    }
+  }
+  const nextPercobaan = finished.length + 1;
 
   const dataSoal = await generateDataSoal(idmTes);
 
   try {
     const [result] = await db.execute(
       `INSERT INTO tbh_tes (idm_tes, percobaan, data_soal, nilai, waktu_mulai, status, created_by, updated_by)
-       VALUES (?, 1, ?, 0, NOW(), 1, ?, ?)`,
-      [idmTes, JSON.stringify(dataSoal), pesertaId, pesertaId],
+       VALUES (?, ?, ?, 0, NOW(), 1, ?, ?)`,
+      [idmTes, nextPercobaan, JSON.stringify(dataSoal), pesertaId, pesertaId],
     );
     return { idh_tes: result.insertId, resumed: false };
   } catch (err) {
@@ -232,8 +262,9 @@ const getAttempt = async (idhTes, pesertaId) => {
   jawabanRows.forEach((j) => { jawabanMap[j.idm_soal] = { idm_pilihan: j.idm_pilihan, jawaban_essai: j.jawaban_essai }; });
 
   const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+  const dataSoalHydrated = await hydrateDataSoal(dataSoal);
   // Sanitasi — jangan expose skor ke peserta
-  const soalSanitized = dataSoal.map(({ skor_benar, skor_salah, skor_tidak_jawab, ...rest }) => rest);
+  const soalSanitized = dataSoalHydrated.map(({ skor_benar, skor_salah, skor_tidak_jawab, ...rest }) => rest);
 
   const deadline = computeDeadline(attempt.waktu_mulai, tes.durasi, attempt.durasi_tambahan);
 
@@ -495,6 +526,27 @@ const adminDelete = async (idhTes) => {
   await db.execute(`DELETE FROM tbh_tes WHERE idh_tes = ?`, [idhTes]);
 };
 
+// ─── Reset semua percobaan — admin override, hapus SELURUH riwayat attempt
+// peserta utk 1 ujian (bukan cuma attempt yang lagi tampil di monitoring),
+// dipakai kalau peserta perlu dikasih kesempatan ulang dari nol setelah
+// mentok max_percobaan/skor_maksimal. Beda dari adminRestart (reset 1
+// attempt spesifik in-place, keyed idh_tes) dan adminDelete (hapus 1 attempt
+// spesifik) — ini keyed (idm_tes, peserta), hapus SEMUA baris tbh_tes
+// miliknya supaya mulai() berikutnya hitung ulang dari percobaan=1.
+const adminResetPercobaan = async (idmTes, pesertaId) => {
+  const [rows] = await db.execute(
+    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ?`,
+    [idmTes, pesertaId],
+  );
+  if (!rows.length) throw createError('Peserta ini belum punya percobaan untuk ujian ini.', 404);
+
+  const ids = rows.map((r) => r.idh_tes);
+  const placeholders = ids.map(() => '?').join(',');
+  await db.query(`DELETE FROM tbh_jawaban WHERE idh_tes IN (${placeholders})`, ids);
+  await db.query(`DELETE FROM tbh_tes WHERE idh_tes IN (${placeholders})`, ids);
+  return { dihapus: ids.length };
+};
+
 // ═══ Intervensi manual (DEVELOPMENT, dipicu server-to-server dari ICT) ══════
 // Dipakai buat "meluluskan" peserta susulan yang tidak ikut ujian SIAPTES
 // beneran — bikin 1 attempt LENGKAP (bukan cuma nilai ditulis manual) supaya
@@ -524,14 +576,19 @@ const adminLuluskanManual = async ({ idmGrup, nim, targetNilai }, adminUserId) =
     throw createError('Ujian ini punya tipe soal selain Pilihan Ganda — tidak bisa diintervensi otomatis.', 422);
   }
 
-  // Selalu timpa attempt lama kalau ada (keputusan sadar — lihat komentar di atas)
-  const [[existing]] = await db.execute(
-    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ? LIMIT 1`,
+  // Selalu timpa SEMUA attempt lama kalau ada (keputusan sadar — lihat
+  // komentar di atas). Sejak multi-percobaan aktif, peserta bisa punya
+  // lebih dari 1 baris tbh_tes untuk tes ini — semuanya dihapus, bukan
+  // cuma satu, supaya tidak ada riwayat attempt lama yang nyangkut.
+  const [existingRows] = await db.execute(
+    `SELECT idh_tes FROM tbh_tes WHERE idm_tes = ? AND created_by = ?`,
     [tes.idm_tes, user.ids_user],
   );
-  if (existing) {
-    await db.execute(`DELETE FROM tbh_jawaban WHERE idh_tes = ?`, [existing.idh_tes]);
-    await db.execute(`DELETE FROM tbh_tes WHERE idh_tes = ?`, [existing.idh_tes]);
+  if (existingRows.length) {
+    const ids = existingRows.map((r) => r.idh_tes);
+    const placeholders = ids.map(() => '?').join(',');
+    await db.query(`DELETE FROM tbh_jawaban WHERE idh_tes IN (${placeholders})`, ids);
+    await db.query(`DELETE FROM tbh_tes WHERE idh_tes IN (${placeholders})`, ids);
   }
 
   const soalList = await generateDataSoal(tes.idm_tes);
@@ -623,5 +680,6 @@ module.exports = {
   adminAddDurasi,
   adminRestart,
   adminDelete,
+  adminResetPercobaan,
   adminLuluskanManual,
 };

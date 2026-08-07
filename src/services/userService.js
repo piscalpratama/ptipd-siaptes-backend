@@ -2,10 +2,20 @@ const bcrypt = require('bcryptjs');
 const db = require('../config/db');
 const { parsePagination, buildPaginationMeta } = require('../config/pagination');
 const { createError } = require('../middleware/errorHandler');
+const { buildOrderBy } = require('../utils/buildOrderBy');
+
+const USER_SORT = {
+  nama_asc: 'nama ASC',
+  nama_desc: 'nama DESC',
+  username_asc: 'username ASC',
+  username_desc: 'username DESC',
+  login_desc: 'login DESC',
+  terbaru: 'created_at DESC',
+};
 
 const getAll = async (query) => {
   const { page, limit, offset } = parsePagination(query);
-  const { level, search } = query;
+  const { level, search, sort } = query;
 
   const conditions = [];
   const params = [];
@@ -18,6 +28,7 @@ const getAll = async (query) => {
     params.push(`%${search}%`, `%${search}%`);
   }
   const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const orderBy = buildOrderBy(sort, USER_SORT, 'nama ASC');
 
   const [[{ total }]] = await db.execute(
     `SELECT COUNT(*) as total FROM tbs_user ${where}`,
@@ -25,7 +36,7 @@ const getAll = async (query) => {
   );
   const [rows] = await db.query(
     `SELECT ids_user, nama, username, level, idm_grup, login, logout, created_at
-     FROM tbs_user ${where} ORDER BY nama ASC LIMIT ${limit} OFFSET ${offset}`,
+     FROM tbs_user ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
     params,
   );
 

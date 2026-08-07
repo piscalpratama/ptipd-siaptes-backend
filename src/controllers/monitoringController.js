@@ -59,6 +59,15 @@ const deleteAttempt = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// Reset SEMUA riwayat percobaan peserta utk 1 ujian (bukan cuma 1 attempt
+// yang lagi tampil) — beda dari deleteAttempt yang keyed per idh_tes.
+const resetPercobaan = async (req, res, next) => {
+  try {
+    const result = await ujianService.adminResetPercobaan(req.params.idmTes, req.params.idsUser);
+    return res.success(result, `${result.dihapus} riwayat percobaan peserta berhasil dihapus. Peserta bisa mulai dari percobaan ke-1 lagi.`);
+  } catch (err) { next(err); }
+};
+
 module.exports = {
   getMonitoring,
   pauseAttempt,
@@ -67,4 +76,5 @@ module.exports = {
   tambahDurasi,
   restartAttempt,
   deleteAttempt,
+  resetPercobaan,
 };
