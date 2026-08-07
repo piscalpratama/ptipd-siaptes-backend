@@ -382,7 +382,9 @@ const getHasil = async (idhTes, pesertaId) => {
   if (!attempt) throw createError('Attempt ujian tidak ditemukan.', 404);
 
   const [[tes]] = await db.execute(
-    `SELECT nama_tes, durasi, skor_maksimal, status_hasil, status_detail_tes FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
+    `SELECT nama_tes, durasi, skor_maksimal, status_hasil, status_detail_tes,
+            tgl_mulai, tgl_akhir, max_percobaan, status_token
+     FROM tbm_tes WHERE idm_tes = ? LIMIT 1`,
     [attempt.idm_tes],
   );
 
@@ -398,6 +400,31 @@ const getHasil = async (idhTes, pesertaId) => {
     Object.assign(attempt, fresh);
   }
   if (attempt.status !== 2) throw createError('Ujian belum diselesaikan.', 400);
+
+  // Ringkasan lintas-percobaan — dipakai buat tombol "Coba Lagi" DAN (kalau
+  // nilai ditampilkan) rincian nilai tiap percobaan. Logika eligibilitas
+  // sama persis dengan getSaya()/dashboard, supaya tombol yang muncul di
+  // sini konsisten sama yang di dashboard.
+  const [attempts] = await db.execute(
+    `SELECT idh_tes, percobaan, nilai, waktu_mulai, waktu_akhir, status FROM tbh_tes
+     WHERE idm_tes = ? AND created_by = ? ORDER BY percobaan ASC`,
+    [attempt.idm_tes, pesertaId],
+  );
+  const finishedAttempts = attempts.filter((a) => a.status === 2);
+  const adaOngoing = attempts.some((a) => a.status === 1);
+  const bestNilai = finishedAttempts.length ? Math.max(...finishedAttempts.map((a) => a.nilai)) : null;
+  const now = new Date();
+  const dalamJadwal = now >= new Date(tes.tgl_mulai) && now <= new Date(tes.tgl_akhir);
+  const bisaCobaLagi = !adaOngoing && dalamJadwal && bestNilai !== null && bestNilai < tes.skor_maksimal &&
+    (tes.max_percobaan == null || finishedAttempts.length < tes.max_percobaan);
+  const ringkasanPercobaan = {
+    idm_tes: attempt.idm_tes,
+    status_token: tes.status_token,
+    max_percobaan: tes.max_percobaan,
+    jumlah_percobaan: finishedAttempts.length,
+    nilai_terbaik: bestNilai,
+    bisa_coba_lagi: bisaCobaLagi,
+  };
 
   if (tes.status_hasil !== 1) {
     // status_hasil ini toggle ON/OFF biasa di setting tes ("Tampilkan nilai ke
@@ -420,6 +447,7 @@ const getHasil = async (idhTes, pesertaId) => {
       jumlah_dijawab,
       total_soal: dataSoal.length,
       pesan: 'Nilai untuk ujian ini tidak ditampilkan kepada peserta.',
+      ...ringkasanPercobaan,
     };
   }
 
@@ -429,7 +457,21 @@ const getHasil = async (idhTes, pesertaId) => {
     nilai: attempt.nilai,
     waktu_mulai: attempt.waktu_mulai,
     waktu_akhir: attempt.waktu_akhir,
+    ...ringkasanPercobaan,
   };
+  // Rincian tiap percobaan (percobaan+nilai) — cuma masuk akal ditampilkan
+  // kalau lebih dari 1 percobaan, tapi dikirim apa adanya, biar frontend yang
+  // putuskan tampil/tidak (konsisten dgn pola field lain di endpoint ini).
+  if (finishedAttempts.length > 1) {
+    result.riwayat_percobaan = finishedAttempts.map((a) => ({
+      idh_tes: a.idh_tes,
+      percobaan: a.percobaan,
+      nilai: a.nilai,
+      waktu_mulai: a.waktu_mulai,
+      waktu_akhir: a.waktu_akhir,
+      is_current: a.idh_tes === Number(idhTes),
+    }));
+  }
   if (tes.status_detail_tes === 1) {
     result.detail_nilai = typeof attempt.detail_nilai === 'string' ? JSON.parse(attempt.detail_nilai) : attempt.detail_nilai;
   }
