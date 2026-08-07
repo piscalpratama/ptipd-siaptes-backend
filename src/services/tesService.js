@@ -38,7 +38,7 @@ const getAll = async (query) => {
     params,
   );
   const [rows] = await db.query(
-    `SELECT idm_tes, nama_tes, keterangan, tgl_mulai, tgl_akhir, durasi, skor_maksimal,
+    `SELECT idm_tes, nama_tes, keterangan, tgl_mulai, tgl_akhir, durasi, skor_maksimal, max_percobaan,
             status_hasil, status_detail_tes, status_token, created_at, updated_at
      FROM tbm_tes ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
     params,
@@ -71,14 +71,14 @@ const getById = async (id) => {
 const create = async (data, userId) => {
   const {
     nama_tes, keterangan, tgl_mulai, tgl_akhir, durasi,
-    skor_maksimal, status_hasil, status_detail_tes, status_token,
+    skor_maksimal, max_percobaan, status_hasil, status_detail_tes, status_token,
   } = data;
 
   const [result] = await db.execute(
     `INSERT INTO tbm_tes
-     (nama_tes, keterangan, tgl_mulai, tgl_akhir, durasi, skor_maksimal,
+     (nama_tes, keterangan, tgl_mulai, tgl_akhir, durasi, skor_maksimal, max_percobaan,
       status_hasil, status_detail_tes, status_token, is_deleted, created_by, updated_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
     [
       nama_tes,
       keterangan || '',
@@ -86,6 +86,7 @@ const create = async (data, userId) => {
       toSqlDatetime(tgl_akhir),
       durasi,
       skor_maksimal,
+      max_percobaan ?? null,
       status_hasil ?? 1,
       status_detail_tes ?? 0,
       status_token ?? 0,
@@ -105,7 +106,7 @@ const update = async (id, data, userId) => {
   const dateFields = new Set(['tgl_mulai', 'tgl_akhir']);
   const allowed = [
     'nama_tes', 'keterangan', 'tgl_mulai', 'tgl_akhir', 'durasi',
-    'skor_maksimal', 'status_hasil', 'status_detail_tes', 'status_token',
+    'skor_maksimal', 'max_percobaan', 'status_hasil', 'status_detail_tes', 'status_token',
   ];
   allowed.forEach((k) => {
     if (data[k] !== undefined) {

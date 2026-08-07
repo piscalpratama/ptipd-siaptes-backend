@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const { createError } = require('../middleware/errorHandler');
 const { computeNilai } = require('./ujianService');
+const { hydrateDataSoal } = require('../utils/hydrateSoal');
 
 const getPengumpulan = async (idmTes) => {
   const [attempts] = await db.execute(
@@ -38,7 +39,8 @@ const getAttemptDetail = async (idhTes) => {
   );
   if (!attempt) throw createError('Attempt tidak ditemukan.', 404);
 
-  const dataSoal = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+  const dataSoalRaw = (typeof attempt.data_soal === 'string' ? JSON.parse(attempt.data_soal) : attempt.data_soal) || [];
+  const dataSoal = await hydrateDataSoal(dataSoalRaw);
   const [jawabanRows] = await db.execute(
     `SELECT idh_jawaban, idm_soal, idm_pilihan, jawaban_essai, nilai FROM tbh_jawaban WHERE idh_tes = ?`,
     [idhTes],

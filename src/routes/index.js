@@ -120,6 +120,9 @@ router.post('/ujian/monitoring/attempt/:idhTes/stop', authenticate, authorize(..
 router.post('/ujian/monitoring/attempt/:idhTes/tambah-durasi', authenticate, authorize(...TES_LEVELS), monitoringController.tambahDurasi);
 router.post('/ujian/monitoring/attempt/:idhTes/restart', authenticate, authorize(...TES_LEVELS), monitoringController.restartAttempt);
 router.delete('/ujian/monitoring/attempt/:idhTes', authenticate, authorize(...TES_LEVELS), monitoringController.deleteAttempt);
+// Reset SEMUA riwayat percobaan peserta utk 1 ujian (bukan cuma 1 attempt) —
+// beda dari delete di atas yang keyed per idh_tes (1 attempt spesifik).
+router.delete('/ujian/monitoring/:idmTes/peserta/:idsUser/percobaan', authenticate, authorize(...TES_LEVELS), monitoringController.resetPercobaan);
 
 // ─── Integrasi ICT ────────────────────────────────────────────────────────────
 // POST /integrasi/peserta — dipanggil BE ICT (server-to-server), pakai

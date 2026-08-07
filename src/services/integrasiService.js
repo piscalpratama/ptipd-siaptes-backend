@@ -67,29 +67,56 @@ const pushPeserta = async (idmGrup, pesertaList) => {
 // ─── Histori nilai — kontrak lama yang sudah dipakai syncNilaiService.js ─────
 // di BE ICT. Response HARUS { data: { data: [...] } } dengan field
 // `username`, `nilai`, `nama` minimal ada, karena itu yang dibaca di sana.
+//
+// Sejak multi-percobaan aktif, 1 peserta bisa punya BEBERAPA baris selesai
+// (status=2) untuk 1 idm_tes yang sama — endpoint ini WAJIB dedup ke nilai
+// TERTINGGI per (username, idm_tes), dihitung dari SEMUA attempt selesai
+// (tanpa batas tanggal), supaya ICT tidak pernah nyimpen nilai yang lebih
+// rendah dari nilai terbaik peserta cuma gara-gara urutan/window sync.
+// Filter tanggal (`waktu_mulai`/`waktu_akhir`) cuma dipakai buat nentuin
+// PASANGAN (username, idm_tes) mana yang "ada aktivitas baru" di window itu
+// (lewat EXISTS) — begitu lolos, nilai yang dikembalikan tetap yang terbaik
+// secara keseluruhan, bukan yang terbaik di dalam window saja.
 const getHistori = async (query) => {
   const { page, limit, offset } = parsePagination(query);
   const { waktu_mulai, waktu_akhir } = query;
 
-  const conditions = ['status = 2'];
-  const params = [];
+  const windowConditions = [];
+  const windowParams = [];
   if (waktu_mulai) {
-    conditions.push('waktu_akhir >= ?');
-    params.push(waktu_mulai);
+    windowConditions.push('w.waktu_akhir >= ?');
+    windowParams.push(waktu_mulai);
   }
   if (waktu_akhir) {
-    conditions.push('waktu_akhir <= ?');
-    params.push(waktu_akhir);
+    windowConditions.push('w.waktu_akhir <= ?');
+    windowParams.push(waktu_akhir);
   }
-  const where = `WHERE ${conditions.join(' AND ')}`;
+  const windowWhere = windowConditions.length ? `AND ${windowConditions.join(' AND ')}` : '';
 
-  const [[{ total }]] = await db.execute(
-    `SELECT COUNT(*) as total FROM viewh_tes ${where}`,
+  const baseQuery = `
+    FROM viewh_tes v
+    JOIN (
+      SELECT username, idm_tes, MAX(nilai) AS best_nilai
+      FROM viewh_tes WHERE status = 2 GROUP BY username, idm_tes
+    ) best ON best.username = v.username AND best.idm_tes = v.idm_tes AND best.best_nilai = v.nilai
+    WHERE v.status = 2
+      AND EXISTS (
+        SELECT 1 FROM viewh_tes w
+        WHERE w.username = v.username AND w.idm_tes = v.idm_tes AND w.status = 2 ${windowWhere}
+      )
+    GROUP BY v.username, v.idm_tes
+  `;
+  // params dipakai 2x (sekali di JOIN best tidak butuh param, sekali di EXISTS)
+  const params = [...windowParams];
+
+  const [[{ total }]] = await db.query(
+    `SELECT COUNT(*) as total FROM (SELECT 1 ${baseQuery}) x`,
     params,
   );
   const [rows] = await db.query(
-    `SELECT idh_tes, idm_tes, nama, username, nama_tes, nilai, waktu_mulai, waktu_akhir
-     FROM viewh_tes ${where} ORDER BY waktu_akhir DESC LIMIT ${limit} OFFSET ${offset}`,
+    `SELECT v.idh_tes, v.idm_tes, v.nama, v.username, v.nama_tes, v.nilai, v.waktu_mulai, v.waktu_akhir
+     ${baseQuery}
+     ORDER BY v.waktu_akhir DESC LIMIT ${limit} OFFSET ${offset}`,
     params,
   );
 

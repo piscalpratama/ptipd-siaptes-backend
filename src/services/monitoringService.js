@@ -14,21 +14,29 @@ const getMonitoring = async (idmTes) => {
   );
   if (!tes) throw createError('Ujian tidak ditemukan.', 404);
 
-  // Semua peserta yang di-assign ke tes ini lewat grup manapun yang tertaut,
-  // LEFT JOIN attempt-nya kalau sudah ada (single-attempt model, jadi paling
-  // banyak 1 baris tbh_tes per peserta per tes).
+  // Semua peserta yang di-assign ke tes ini lewat grup manapun yang tertaut.
+  // Sejak multi-percobaan aktif, peserta bisa punya LEBIH DARI 1 baris
+  // tbh_tes untuk tes yang sama — join lewat correlated subquery yang
+  // prioritaskan attempt yang SEDANG BERJALAN, else attempt PALING TERAKHIR,
+  // supaya tetap tepat 1 baris per peserta di sini (bukan fan-out).
   const [rows] = await db.query(
     `SELECT u.ids_user, u.nama, u.username,
-            a.idh_tes, a.waktu_mulai, a.waktu_akhir, a.status, a.nilai, a.data_soal, a.durasi_tambahan
+            a.idh_tes, a.waktu_mulai, a.waktu_akhir, a.status, a.nilai, a.data_soal, a.durasi_tambahan,
+            (SELECT COUNT(*) FROM tbh_tes t3 WHERE t3.idm_tes = ? AND t3.created_by = u.ids_user AND t3.status = 2) AS jumlah_percobaan
      FROM (
        SELECT DISTINCT u2.ids_user, u2.nama, u2.username
        FROM tbr_tes_grup tg
        JOIN tbs_user u2 ON FIND_IN_SET(tg.idm_grup, u2.idm_grup) AND u2.level = 'PESERTA'
        WHERE tg.idm_tes = ?
      ) u
-     LEFT JOIN tbh_tes a ON a.idm_tes = ? AND a.created_by = u.ids_user
+     LEFT JOIN tbh_tes a ON a.idh_tes = (
+       SELECT t2.idh_tes FROM tbh_tes t2
+       WHERE t2.idm_tes = ? AND t2.created_by = u.ids_user
+       ORDER BY (t2.status = 1) DESC, t2.idh_tes DESC
+       LIMIT 1
+     )
      ORDER BY u.nama ASC`,
-    [idmTes, idmTes],
+    [idmTes, idmTes, idmTes],
   );
 
   const now = Date.now();
@@ -50,6 +58,7 @@ const getMonitoring = async (idmTes) => {
         total_soal: 0,
         sisa_detik: null,
         terakhir_aktif: null,
+        jumlah_percobaan: r.jumlah_percobaan,
       });
       continue;
     }
@@ -89,6 +98,7 @@ const getMonitoring = async (idmTes) => {
       sisa_detik: status === 'sedang' ? Math.max(0, Math.round((deadline - now) / 1000)) : null,
       terakhir_aktif,
       durasi_tambahan: r.durasi_tambahan || 0,
+      jumlah_percobaan: r.jumlah_percobaan,
     });
   }
 
